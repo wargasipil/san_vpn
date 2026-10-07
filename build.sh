@@ -3,7 +3,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-version="$(date +%Y.%m.%d-%H%M)"
+# The release workflow passes the tag; a local build is stamped with the time.
+version="${SAN_VPN_VERSION:-$(date +%Y.%m.%d-%H%M)}"
 
 # The Windows build embeds wintun.dll (amd64), the driver library from
 # wintun.net. It is not checked in; fetch it once and pin its checksum.

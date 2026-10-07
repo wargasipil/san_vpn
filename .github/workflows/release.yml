@@ -1,0 +1,59 @@
+# Push a version tag and this builds, tests and publishes a GitHub release:
+#
+#   git tag -a v0.2.0 -m "san_vpn v0.2.0" && git push origin v0.2.0
+#
+# The binaries come from build.sh, the same script as a local build, stamped
+# with the tag as their version. A tag with a "-" (v0.2.0-rc1) becomes a
+# prerelease.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet, test and build
+        env:
+          SAN_VPN_VERSION: ${{ github.ref_name }}
+        run: bash build.sh
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp bin/san_vpn.exe dist/san_vpn-windows-amd64.exe
+          cp bin/san_vpn dist/san_vpn-linux-amd64
+          # The Windows binary embeds wintun.dll; its license travels with it.
+          cp internal/osnet/wintun/LICENSE.txt dist/wintun-LICENSE.txt
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          ./bin/san_vpn --version
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          One file per OS. Setup is in the [README](https://github.com/$REPO/blob/$TAG/README.md).
+
+          - **Windows**: \`san_vpn-windows-amd64.exe\`. Wintun is built in; \`up\` writes \`wintun.dll\` next to the exe.
+          - **Linux**: \`san_vpn-linux-amd64\`, then \`chmod +x\`.
+          - Check downloads against \`SHA256SUMS\`.
+          EOF
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/* "${prerelease[@]}" \
+            --verify-tag --title "san_vpn $TAG" \
+            --notes-file notes.md --generate-notes

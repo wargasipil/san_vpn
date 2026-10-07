@@ -24,6 +24,31 @@ The design and the reasoning behind it live in
 [`docs/external_repo/san_vpn.md`](../../../docs/external_repo/san_vpn.md)
 in the parent repository.
 
+## Download
+
+Each [release](https://github.com/wargasipil/san_vpn/releases) has one file
+per OS, plus `SHA256SUMS`:
+
+```sh
+# Linux
+curl -fsSLo san_vpn https://github.com/wargasipil/san_vpn/releases/latest/download/san_vpn-linux-amd64
+chmod +x san_vpn
+```
+
+```powershell
+# Windows
+Invoke-WebRequest -OutFile san_vpn.exe https://github.com/wargasipil/san_vpn/releases/latest/download/san_vpn-windows-amd64.exe
+```
+
+Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
+when a version tag is pushed. It runs `build.sh` with the tag as the version, so
+`san_vpn --version` prints the tag:
+
+```sh
+git tag -a v0.2.0 -m "san_vpn v0.2.0"
+git push origin v0.2.0
+```
+
 ## Build
 
 ```powershell

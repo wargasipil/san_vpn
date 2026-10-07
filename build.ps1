@@ -5,7 +5,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $root
 try {
-    $version = Get-Date -Format "yyyy.MM.dd-HHmm"
+    # The release workflow passes the tag; a local build is stamped with the time.
+    $version = if ($env:SAN_VPN_VERSION) { $env:SAN_VPN_VERSION } else { Get-Date -Format "yyyy.MM.dd-HHmm" }
 
     # The Windows build embeds wintun.dll (amd64), the driver library from
     # wintun.net. It is not checked in; fetch it once and pin its checksum.
