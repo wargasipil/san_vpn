@@ -1,0 +1,3 @@
+bin/
+# Fetched by build.ps1 / build.sh, checksum pinned there.
+internal/osnet/wintun/
