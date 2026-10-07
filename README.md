@@ -90,8 +90,10 @@ san_vpn setup init
 
 This does everything the dev tunnel needs, and each step checks before it acts:
 
-- installs the `devtunnel` CLI if it is missing (winget on Windows,
-  Microsoft's script on Linux)
+- installs the `devtunnel` CLI if it is missing: winget on Windows, or,
+  where winget is missing or fails (Windows Server, LTSC, older Windows 10),
+  Microsoft's direct download into `%LocalAppData%\san_vpn`. On Linux it uses
+  Microsoft's install script.
 - signs you in with GitHub; a browser opens. On Linux with no display it
   prints a device code instead (`--device-code` forces that)
 - creates the relay's key and network
@@ -237,6 +239,8 @@ Global flags: `--state <dir>` (env `SAN_VPN_STATE`) and `--log-level`
 
 ## Limits
 
+- **Windows 10 or Windows Server 2016 and newer.** That is the oldest Windows
+  that Go programs run on. Windows 7 and 8.1 are out.
 - **Every packet passes through the relay.** Latency is home → relay → office,
   and the relay's bandwidth is the network's bandwidth.
   - Microsoft dev tunnels are a developer service with usage limits (reported

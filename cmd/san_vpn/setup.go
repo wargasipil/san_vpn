@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 
 	"github.com/urfave/cli/v3"
 
@@ -52,12 +51,10 @@ func runSetupInit(ctx context.Context, cmd *cli.Command) error {
 
 	cliPath, err := devtunnel.Find()
 	if errors.Is(err, devtunnel.ErrNotInstalled) {
-		install := strings.Join(devtunnel.InstallCommand(), " ")
 		if cmd.Bool("no-install") {
-			return fmt.Errorf("the devtunnel CLI is not installed; install it with: %s", install)
+			return fmt.Errorf("the devtunnel CLI is not installed; install it with: %s", devtunnel.InstallHint())
 		}
-		fmt.Fprintf(w, "  ..   installing the devtunnel CLI: %s\n", install)
-		cliPath, err = devtunnel.Install(ctx, os.Stdout, os.Stderr)
+		cliPath, err = devtunnel.Install(ctx, w, os.Stdout, os.Stderr)
 	}
 	if err != nil {
 		return err

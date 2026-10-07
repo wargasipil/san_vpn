@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,7 +98,8 @@ func run(ctx context.Context, path string, args []string) ([]byte, []byte, int, 
 // Find locates the CLI: on PATH, or where its installers put it. Installers
 // update PATH for new terminals only -- winget adds its package folder to the
 // user PATH in the registry, Microsoft's Linux script installs to ~/bin --
-// so right after installing, the second half is what finds it.
+// so right after installing, the second half is what finds it. It also finds
+// the copy Install downloads where winget is missing.
 func Find() (string, error) {
 	if p, err := exec.LookPath("devtunnel"); err == nil {
 		return p, nil
@@ -128,28 +130,127 @@ func installLocations() []string {
 		pkgs, _ := filepath.Glob(filepath.Join(winget, "Packages", "Microsoft.devtunnel_*", "devtunnel.exe"))
 		out = append(out, pkgs...)
 	}
+	if p := downloadPath(); p != "" {
+		out = append(out, p)
+	}
 	return out
 }
 
-// InstallCommand is how the CLI gets installed on this platform: winget on
-// Windows, Microsoft's install script elsewhere.
-func InstallCommand() []string {
-	if runtime.GOOS == "windows" {
-		return []string{"winget", "install", "--id", "Microsoft.devtunnel", "--exact",
-			"--accept-source-agreements", "--accept-package-agreements"}
+var (
+	wingetCommand = []string{"winget", "install", "--id", "Microsoft.devtunnel", "--exact",
+		"--accept-source-agreements", "--accept-package-agreements"}
+	scriptCommand = []string{"sh", "-c", "curl -sL https://aka.ms/DevTunnelCliInstall | bash"}
+)
+
+// DownloadURL is Microsoft's direct link to the Windows CLI, the way in where
+// winget is missing (Windows Server, LTSC, older Windows 10) or fails. There
+// is no arm64 build behind it. san_vpn ships for amd64 only, and Windows on
+// Arm runs both under emulation.
+const DownloadURL = "https://aka.ms/TunnelsCliDownload/win-x64"
+
+// downloadPath is where Install puts a downloaded CLI: per user, like the
+// sign-in it will hold.
+func downloadPath() string {
+	if runtime.GOOS != "windows" {
+		return ""
 	}
-	return []string{"sh", "-c", "curl -sL https://aka.ms/DevTunnelCliInstall | bash"}
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "san_vpn", "devtunnel.exe")
 }
 
-// Install runs InstallCommand in the user's terminal and finds the result.
-func Install(ctx context.Context, stdout, stderr io.Writer) (string, error) {
-	argv := InstallCommand()
+// InstallHint tells a person how to install the CLI themselves.
+func InstallHint() string {
+	if runtime.GOOS == "windows" {
+		return strings.Join(wingetCommand[:5], " ") + ", or save " + DownloadURL + " as devtunnel.exe in a folder on PATH"
+	}
+	return strings.Join(scriptCommand[2:], " ")
+}
+
+// Install installs the CLI, reporting each step to w, and returns its path.
+// On Windows that is winget, and where winget is missing or fails, a download
+// of Microsoft's exe. Elsewhere it is Microsoft's install script. The
+// installers' own output goes to stdout and stderr.
+func Install(ctx context.Context, w, stdout, stderr io.Writer) (string, error) {
+	if runtime.GOOS != "windows" {
+		return runInstaller(ctx, w, stdout, stderr, scriptCommand)
+	}
+	if _, err := exec.LookPath("winget"); err != nil {
+		fmt.Fprintln(w, "  ..   winget is not available")
+	} else {
+		p, err := runInstaller(ctx, w, stdout, stderr, wingetCommand)
+		if err == nil || ctx.Err() != nil {
+			return p, err
+		}
+		fmt.Fprintf(w, "  ..   %v\n", err)
+	}
+	dst := downloadPath()
+	if dst == "" {
+		return "", errors.New("install devtunnel: LOCALAPPDATA is not set")
+	}
+	fmt.Fprintf(w, "  ..   downloading the devtunnel CLI: %s -> %s\n", DownloadURL, dst)
+	if err := DownloadExe(ctx, http.DefaultClient, DownloadURL, dst); err != nil {
+		return "", fmt.Errorf("install devtunnel: %w", err)
+	}
+	return dst, nil
+}
+
+func runInstaller(ctx context.Context, w, stdout, stderr io.Writer, argv []string) (string, error) {
+	fmt.Fprintf(w, "  ..   installing the devtunnel CLI: %s\n", strings.Join(argv, " "))
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("install devtunnel (%s): %w", strings.Join(argv, " "), err)
 	}
 	return Find()
+}
+
+// DownloadExe saves the Windows executable at url as path. The file is
+// replaced only once a whole executable is in: a link that is retired
+// redirects to a web page, and that must not land as devtunnel.exe.
+func DownloadExe(ctx context.Context, client *http.Client, url, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".download-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // a no-op once renamed
+	head := make([]byte, 2)
+	n, err := io.ReadFull(resp.Body, head)
+	if err == nil && string(head) != "MZ" {
+		err = fmt.Errorf("GET %s: not an executable (%s)", url, resp.Header.Get("Content-Type"))
+	} else if err != nil {
+		err = fmt.Errorf("GET %s: not an executable (%d bytes)", url, n)
+	}
+	if err == nil {
+		_, err = tmp.Write(head)
+	}
+	if err == nil {
+		_, err = io.Copy(tmp, resp.Body)
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // jsonCall runs a command with --json --nologo and decodes its output; with
