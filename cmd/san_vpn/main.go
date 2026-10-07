@@ -32,6 +32,7 @@ import (
 	"github.com/wargasipil/san_vpn/internal/osnet"
 	"github.com/wargasipil/san_vpn/internal/relay"
 	"github.com/wargasipil/san_vpn/internal/state"
+	"github.com/wargasipil/san_vpn/internal/update"
 )
 
 // version is stamped by the build scripts.
@@ -64,9 +65,12 @@ func root(out io.Writer) *cli.Command {
 				return ctx, fmt.Errorf("bad --log-level %q", cmd.String("log-level"))
 			}
 			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+			if exe, err := os.Executable(); err == nil {
+				update.RemoveOld(exe) // what the last `update` moved aside on Windows
+			}
 			return ctx, nil
 		},
-		Commands: []*cli.Command{setupCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand()},
+		Commands: []*cli.Command{setupCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand(), updateCommand()},
 	}
 }
 

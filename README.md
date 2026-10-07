@@ -40,6 +40,21 @@ chmod +x san_vpn
 Invoke-WebRequest -OutFile san_vpn.exe https://github.com/wargasipil/san_vpn/releases/latest/download/san_vpn-windows-amd64.exe
 ```
 
+Later, the binary updates itself:
+
+```sh
+san_vpn update --check        # is a newer release out?
+san_vpn update                # install the latest release
+san_vpn update v0.1.0         # or a given one, older ones too
+```
+
+It downloads this OS's file from the release, checks it against `SHA256SUMS`,
+runs its `--version`, and only then replaces itself. A binary in a protected
+folder (`/usr/local/bin`, `Program Files`) needs `sudo` or an administrator
+terminal. A running `up` or `relay run` keeps the old version until it
+restarts. A local build, stamped with its build time, is replaced only with
+`--force`.
+
 Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
 when a version tag is pushed. It runs `build.sh` with the tag as the version, so
 `san_vpn --version` prints the tag:
@@ -186,6 +201,7 @@ A recent handshake proves the whole path works.
 | `join <invite> [--url U] [--header "K: V"] [--force]` | member, admin | Generate this machine's key and join. The private key never leaves the machine. |
 | `up [--interface I] [--mtu M] [--no-firewall]` | member, admin | Create the tunnel interface and stay connected, reconnecting by itself. |
 | `status [--json]` | member | This machine's connection and its peers. |
+| `update [tag] [--check] [--force]` | any | Replace this binary with the latest release, or with release `tag`, once it matches `SHA256SUMS` and runs. |
 
 The admin commands (`invite`, `remove`) change the relay's file while
 `relay run` is running, and it picks up the change. There is no admin port.
