@@ -70,7 +70,7 @@ func root(out io.Writer) *cli.Command {
 			}
 			return ctx, nil
 		},
-		Commands: []*cli.Command{setupCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand(), updateCommand()},
+		Commands: []*cli.Command{setupCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand(), profileCommand(), updateCommand()},
 	}
 }
 
@@ -324,6 +324,7 @@ func runRelayInvite(ctx context.Context, cmd *cli.Command) error {
 	fmt.Fprintln(w, "On the new machine, from an administrator terminal (sudo on Linux):")
 	fmt.Fprintln(w, "  san_vpn join <invite>")
 	fmt.Fprintln(w, "  san_vpn up")
+	fmt.Fprintln(w, "A machine already in another network keeps both with: san_vpn join --profile <name> <invite>")
 	return nil
 }
 
@@ -440,6 +441,7 @@ func joinCommand() *cli.Command {
 			&cli.StringFlag{Name: "url", Usage: "reach the relay here instead of the invite's URL, e.g. http://127.0.0.1:8443 on the relay machine itself"},
 			&cli.StringSliceFlag{Name: "header", Usage: `extra header for the relay's front, as "Name: value" (repeatable)`},
 			&cli.BoolFlag{Name: "force", Usage: "replace this machine's existing membership"},
+			&cli.StringFlag{Name: "profile", Sources: cli.EnvVars("SAN_VPN_PROFILE"), Usage: "keep this membership under profile `name`, beside the networks this machine is already in (default: the current profile)"},
 		},
 		Action: runJoin,
 	}
@@ -478,10 +480,18 @@ func runJoin(ctx context.Context, cmd *cli.Command) error {
 			return err
 		}
 	}
-	path := filepath.Join(dir, state.NodeFile)
+	profile, err := memberProfile(cmd, dir, false)
+	if err != nil {
+		return memberErr("san_vpn join", err)
+	}
+	pdir := state.ProfileDir(dir, profile)
+	path := filepath.Join(pdir, state.NodeFile)
 	var existing node.Config
 	if err := state.Load(path, &existing); err == nil && !cmd.Bool("force") {
-		return fmt.Errorf("this machine already joined as %q (%s); pass --force to replace it", existing.Name, existing.IP)
+		if cmd.String("profile") != "" {
+			return fmt.Errorf("profile %q already joined as %q (%s); pass --force to replace it", profile, existing.Name, existing.IP)
+		}
+		return fmt.Errorf("this machine already joined as %q (%s); to join another network beside it, pass --profile <name>; to replace it, --force", existing.Name, existing.IP)
 	}
 
 	jctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -497,10 +507,34 @@ func runJoin(ctx context.Context, cmd *cli.Command) error {
 	if err := state.EnsureDir(dir, osnet.Elevated()); err != nil {
 		return err
 	}
+	if pdir != dir {
+		if err := state.EnsureDir(pdir, osnet.Elevated()); err != nil {
+			return err
+		}
+	}
 	if err := state.Save(path, cfg); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.Root().Writer, "joined as %q with address %s\nStart it with: san_vpn up\n", cfg.Name, cfg.Prefix())
+	// The first membership is the one `up` brings up, whatever its profile is
+	// called, so `join --profile x` then `up` works on a fresh machine.
+	if cur, err := state.CurrentProfile(dir); err == nil && cur != profile {
+		if ok, err := state.Joined(dir, cur); err == nil && !ok {
+			if err := state.SetCurrentProfile(dir, profile); err != nil {
+				return err
+			}
+		}
+	}
+
+	w := cmd.Root().Writer
+	if profile == state.DefaultProfile {
+		fmt.Fprintf(w, "joined as %q with address %s\n", cfg.Name, cfg.Prefix())
+	} else {
+		fmt.Fprintf(w, "joined as %q with address %s, in profile %q\n", cfg.Name, cfg.Prefix(), profile)
+	}
+	fmt.Fprintf(w, "Start it with: %s\n", upFor(dir, profile))
+	if upFor(dir, profile) != "san_vpn up" {
+		fmt.Fprintf(w, "or make it the one san_vpn up brings up: san_vpn profile use %s\n", profile)
+	}
 	return nil
 }
 
@@ -512,6 +546,7 @@ func upCommand() *cli.Command {
 			&cli.StringFlag{Name: "interface", Value: osnet.DefaultName, Usage: "tunnel interface name"},
 			&cli.IntFlag{Name: "mtu", Value: osnet.DefaultMTU, Usage: "tunnel MTU"},
 			&cli.BoolFlag{Name: "no-firewall", Usage: "on Windows, do not add the inbound firewall rule for the other members"},
+			profileFlag(),
 		},
 		Action: runUp,
 	}
@@ -525,10 +560,23 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	profile, err := memberProfile(cmd, dir, false)
+	if err != nil {
+		return err
+	}
+	// One profile at a time: each would make an interface of the same name,
+	// and both networks are usually 10.77.0.0/24.
+	if run, st, ok := runningProfile(dir); ok {
+		if run == profile {
+			return fmt.Errorf("san_vpn up is already running (pid %d)", st.PID)
+		}
+		return fmt.Errorf("san_vpn up is already running on profile %q (pid %d); stop it first, one profile is up at a time", run, st.PID)
+	}
+	pdir := state.ProfileDir(dir, profile)
 	var cfg node.Config
-	if err := state.Load(filepath.Join(dir, state.NodeFile), &cfg); err != nil {
+	if err := state.Load(filepath.Join(pdir, state.NodeFile), &cfg); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return errors.New("this machine has not joined a network yet; run `san_vpn join <invite>` first")
+			return notJoined(dir, profile)
 		}
 		return err
 	}
@@ -564,9 +612,9 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 			log.Warn("other members may not reach this machine", "err", err)
 		}
 	}
-	log.Info("san_vpn up", "name", cfg.Name, "address", cfg.Prefix(), "interface", cmd.String("interface"))
+	log.Info("san_vpn up", "name", cfg.Name, "address", cfg.Prefix(), "interface", cmd.String("interface"), "profile", profile)
 
-	statusPath := filepath.Join(dir, state.StatusFile)
+	statusPath := filepath.Join(pdir, state.StatusFile)
 	go func() {
 		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
@@ -590,8 +638,8 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 func statusCommand() *cli.Command {
 	return &cli.Command{
 		Name:   "status",
-		Usage:  "show this machine's connection and the other members",
-		Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}},
+		Usage:  "show this machine's connection and the other members (the running profile, else the current one)",
+		Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}, profileFlag()},
 		Action: runStatus,
 	}
 }
@@ -605,19 +653,30 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	profile, err := memberProfile(cmd, dir, true)
+	if err != nil {
+		return memberErr("san_vpn status", err)
+	}
+	pdir := state.ProfileDir(dir, profile)
+	// Name the profile only once there is more than one to tell apart.
+	label := ""
+	if profilesInUse(dir) {
+		label = ", profile " + profile
+	}
+
 	w := cmd.Root().Writer
 	var st node.Status
-	err = state.Load(filepath.Join(dir, state.StatusFile), &st)
+	err = state.Load(filepath.Join(pdir, state.StatusFile), &st)
 	if errors.Is(err, os.ErrNotExist) {
 		// Not running; say whether it has joined at all.
 		var cfg node.Config
-		err = state.Load(filepath.Join(dir, state.NodeFile), &cfg)
+		err = state.Load(filepath.Join(pdir, state.NodeFile), &cfg)
 		switch {
 		case err == nil:
-			fmt.Fprintf(w, "%s (%s) is not running; start it with: san_vpn up\n", cfg.Name, cfg.Prefix())
+			fmt.Fprintf(w, "%s (%s%s) is not running; start it with: %s\n", cfg.Name, cfg.Prefix(), label, upFor(dir, profile))
 			return nil
 		case errors.Is(err, os.ErrNotExist):
-			fmt.Fprintln(w, "this machine has not joined a network; run `san_vpn join <invite>`")
+			fmt.Fprintln(w, notJoined(dir, profile))
 			return nil
 		}
 	}
@@ -628,16 +687,22 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 		return err
 	}
 	if age := time.Since(st.Updated); age > staleAfter {
-		fmt.Fprintf(w, "%s (%s) is not running (last seen %s ago)\n", st.Name, st.IP, age.Round(time.Second))
+		fmt.Fprintf(w, "%s (%s%s) is not running (last seen %s ago)\n", st.Name, st.IP, label, age.Round(time.Second))
 		return nil
 	}
 	if cmd.Bool("json") {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		return enc.Encode(st)
+		return enc.Encode(struct {
+			Profile string `json:"profile"`
+			node.Status
+		}{profile, st})
 	}
 
 	fmt.Fprintf(w, "%s  %s/%d  ", st.Name, st.IP, st.Network.Bits())
+	if label != "" {
+		fmt.Fprintf(w, "profile %s  ", profile)
+	}
 	if st.Connected {
 		fmt.Fprintf(w, "connected to %s for %s\n", st.Relay, ago(st.Since))
 	} else {

@@ -63,8 +63,13 @@ func Failed(sections []Section) bool {
 // CheckOptions configure Check.
 type CheckOptions struct {
 	// Relay is where the relay's file would be; nil checks no relay.
-	Relay   state.Store
+	Relay state.Store
+	// NodeDir holds the member's node.json and status.json: the node
+	// directory, or one profile's folder in it.
 	NodeDir string
+	// Profile names the member's profile in the title and the fixes; empty
+	// when the machine has only the default one.
+	Profile string
 	// FindCLI locates devtunnel; it is only called for a relay with a tunnel.
 	FindCLI    func() (*devtunnel.CLI, error)
 	HTTPClient *http.Client
@@ -229,6 +234,11 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 func checkMember(ctx context.Context, o CheckOptions) (Section, bool) {
 	path := filepath.Join(o.NodeDir, state.NodeFile)
 	s := Section{Title: "member", Path: path}
+	flag := ""
+	if o.Profile != "" {
+		s.Title = "member, profile " + o.Profile
+		flag = " --profile " + o.Profile
+	}
 	var cfg node.Config
 	if err := state.Load(path, &cfg); err != nil {
 		switch {
@@ -250,7 +260,7 @@ func checkMember(ctx context.Context, o CheckOptions) (Section, bool) {
 	case err == nil:
 		s.add(OK, "", "relay accepts this machine's key")
 	case strings.Contains(err.Error(), "not a member"):
-		s.add(Fail, "ask the relay for a new invite, then san_vpn join --force <invite>", "the relay no longer lists this machine: %v", err)
+		s.add(Fail, "ask the relay for a new invite, then san_vpn join --force"+flag+" <invite>", "the relay no longer lists this machine: %v", err)
 	default:
 		s.add(Fail, "san_vpn setup check on the relay machine", "relay check failed: %v", err)
 	}
@@ -259,7 +269,7 @@ func checkMember(ctx context.Context, o CheckOptions) (Section, bool) {
 	err = state.Load(filepath.Join(o.NodeDir, state.StatusFile), &st)
 	switch {
 	case err != nil || time.Since(st.Updated) > o.StaleAfter:
-		s.add(Fail, "san_vpn up (as administrator)", "san_vpn up is not running")
+		s.add(Fail, "san_vpn up"+flag+" (as administrator)", "san_vpn up is not running")
 	case !st.Connected && st.LastError == "":
 		s.add(Fail, "", "san_vpn up is running, still connecting to the relay")
 	case !st.Connected:

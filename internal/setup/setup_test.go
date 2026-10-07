@@ -409,6 +409,13 @@ func TestCheck(t *testing.T) {
 	if !strings.Contains(text, "no longer lists this machine") || !strings.Contains(text, "join --force") {
 		t.Fatalf("removal not reported:\n%s", text)
 	}
+
+	// A machine with profiles: the title and the fix name the one checked.
+	opts.Profile = "cloudrun"
+	text = dump(Check(ctx, opts))
+	if !strings.Contains(text, "member, profile cloudrun") || !strings.Contains(text, "join --force --profile cloudrun <invite>") {
+		t.Fatalf("profile not named:\n%s", text)
+	}
 }
 
 func TestCheckNothingSetUp(t *testing.T) {

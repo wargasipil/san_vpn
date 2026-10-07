@@ -50,7 +50,7 @@ func setupCommand() *cli.Command {
 			{
 				Name:   "check",
 				Usage:  "check this machine: the relay and its tunnel, and/or this member's connection",
-				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}},
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}, profileFlag()},
 				Action: runSetupCheck,
 			},
 		},
@@ -159,9 +159,28 @@ func runSetupCheck(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		dir = state.NodeDir()
 	}
+	// The member half checks one profile: the one named, else the running
+	// one, else the current one. A directory this terminal may not read is
+	// left to the member check, which says to run it as administrator.
+	profile, err := memberProfile(cmd, dir, true)
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		profile = state.DefaultProfile
+	case err != nil:
+		return err
+	case cmd.String("profile") != "":
+		if ok, err := state.Joined(dir, profile); err == nil && !ok {
+			return notJoined(dir, profile)
+		}
+	}
+	shown := ""
+	if profilesInUse(dir) {
+		shown = profile
+	}
 	sections := setup.Check(ctx, setup.CheckOptions{
 		Relay:   store,
-		NodeDir: dir,
+		NodeDir: state.ProfileDir(dir, profile),
+		Profile: shown,
 		FindCLI: func() (*devtunnel.CLI, error) {
 			p, err := devtunnel.Find()
 			if err != nil {
