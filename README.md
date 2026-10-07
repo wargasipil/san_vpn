@@ -57,7 +57,9 @@ restarts. A local build, stamped with its build time, is replaced only with
 
 Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
 when a version tag is pushed. It runs `build.sh` with the tag as the version, so
-`san_vpn --version` prints the tag:
+`san_vpn --version` prints the tag. It also publishes the relay's container
+image, built from the [`Dockerfile`](Dockerfile), as
+`ghcr.io/wargasipil/san_vpn:<tag>` for Cloud Run:
 
 ```sh
 git tag -a v0.2.0 -m "san_vpn v0.2.0"
@@ -189,17 +191,81 @@ The `RELAY` column is the relay's view: does it have a connection from that
 peer? `HANDSHAKE` is WireGuard's: when the encrypted session was last renewed.
 A recent handshake proves the whole path works.
 
+## Or run the relay on Google Cloud Run
+
+Instead of behind a dev tunnel, the relay can run on Cloud Run. Then no
+machine of yours has to stay on for the network to work, and there is no dev
+tunnel usage limit. It costs money; see below.
+
+**1. Deploy it** from any machine with the
+[gcloud CLI](https://cloud.google.com/sdk/docs/install), signed in with
+`gcloud auth login`:
+
+```powershell
+san_vpn setup cloudrun --dry-run    # look first: lists the gcloud commands it would run
+san_vpn setup cloudrun              # --project, --region (default asia-southeast2, Jakarta)
+```
+
+Like `setup init`, each step checks before it acts, so it is safe to rerun:
+
+- turns on the Cloud Run and Artifact Registry APIs if they are off
+- creates a private bucket, `gs://<project>-san-vpn`, for the relay's file
+  (`--state gs://...` picks another)
+- creates a service account that may read and write that bucket, and nothing
+  else
+- creates the relay's key in the bucket, with your own gcloud sign-in
+- creates an Artifact Registry repository that caches `ghcr.io`, where each
+  release publishes the relay's image (`--image` runs another, and a local
+  build needs it)
+- deploys the service `san-vpn-relay`: one instance at most, a one-hour request
+  timeout, open to anyone. The relay itself admits only its members' keys.
+- records the service's URL as the relay's URL, and checks it, WebSocket
+  included
+
+**2. Invite each machine** from any machine signed in to gcloud. The admin
+commands read and write the bucket directly:
+
+```powershell
+$env:SAN_VPN_STATE = "gs://<project>-san-vpn"
+san_vpn relay invite home
+san_vpn relay list
+san_vpn setup check
+```
+
+Joining and `up` work as with a dev tunnel.
+
+How the relay fits Cloud Run:
+
+- **Its file is in Cloud Storage**, because Cloud Run's disk does not outlive a
+  restart. Every write is conditional on the file's version, so a join and an
+  admin command never overwrite each other. The relay looks for changes every
+  five seconds.
+- **One instance.** Members meet in one process. With two instances, members on
+  different ones could not reach each other. During a deploy Cloud Run may run
+  two for a moment; members reconnect within seconds.
+- **Hour-long connections.** Cloud Run ends every request at its timeout, at
+  most an hour, and each member's connection is one request. The relay asks
+  members to renew a few minutes before that (`SAN_VPN_SESSION_LIMIT`). They
+  open the new connection before closing the old one, so traffic does not stop
+  and WireGuard keeps its sessions.
+- **Cost.** The instance is busy whenever a member is connected, so expect it to
+  run all month: about US$45 a month for 1 vCPU at us-central1 prices after the
+  free tier, more in Jakarta, plus internet egress for every byte the relay
+  forwards. A small VPS is cheaper. Cloud Run is for when you want nothing to
+  look after.
+
 ## Commands
 
 | Command | Where | What |
 |---|---|---|
 | `setup init [--port P] [--tunnel ID] [--device-code] [--no-install]` | relay | Install devtunnel, sign in, and create the relay, its tunnel, anonymous access and port. Safe to rerun. |
+| `setup cloudrun [--project P] [--region R] [--service S] [--image I] [--timeout D] [--dry-run]` | any, with gcloud | Run the relay on Cloud Run, its file in Cloud Storage. Safe to rerun. |
 | `setup check [--json]` | any | Check the relay and its tunnel, and/or this member, end to end. |
 | `relay init [--url U] [--network N]` | relay | Create the relay key and network (default `10.77.0.0/24`). Run it again to change the URL; the key is kept. |
-| `relay run [--listen A] [--no-tunnel]` | relay | Serve the relay (default `127.0.0.1:8443`), and host the dev tunnel that `setup init` made. |
+| `relay run [--listen A] [--no-tunnel] [--session-limit D]` | relay | Serve the relay (default `127.0.0.1:8443`, or `:$PORT` when `PORT` is set), and host the dev tunnel that `setup init` made. With `--session-limit`, members renew their connections before a front cuts them. |
 | `relay invite <name> [--ttl D]` | relay | Print a one-time invite. Names are lowercase letters, digits and `-`. |
 | `relay list [--json]` | relay | List members and invites still waiting. |
-| `relay remove <name>` | relay | Remove a member or an invite. A running relay disconnects the member within a second, and the other members drop it. |
+| `relay remove <name>` | relay | Remove a member or an invite. A running relay disconnects the member within seconds, and the other members drop it. |
 | `join <invite> [--url U] [--header "K: V"] [--force]` | member, admin | Generate this machine's key and join. The private key never leaves the machine. |
 | `up [--interface I] [--mtu M] [--no-firewall]` | member, admin | Create the tunnel interface and stay connected, reconnecting by itself. |
 | `status [--json]` | member | This machine's connection and its peers. |
@@ -208,14 +274,15 @@ A recent handshake proves the whole path works.
 The admin commands (`invite`, `remove`) change the relay's file while
 `relay run` is running, and it picks up the change. There is no admin port.
 
-Global flags: `--state <dir>` (env `SAN_VPN_STATE`) and `--log-level`
-(env `SAN_VPN_LOG_LEVEL`).
+Global flags: `--state <dir>` (env `SAN_VPN_STATE`; for the relay commands
+also `gs://<bucket>[/<folder>]`) and `--log-level` (env `SAN_VPN_LOG_LEVEL`).
 
 ## Where things live
 
 | | Windows | Linux |
 |---|---|---|
 | Relay (`relay.json`) | `%AppData%\san_vpn` | `~/.config/san_vpn` |
+| Relay on Cloud Run | `gs://<project>-san-vpn/relay.json` | the same |
 | Member (`node.json`, `status.json`) | `C:\ProgramData\san_vpn`, SYSTEM and Administrators only | `/var/lib/san_vpn`, mode 0700 |
 | Interface | `san_vpn` (Wintun) | `sanvpn0` (TUN) |
 
@@ -252,4 +319,8 @@ Global flags: `--state <dir>` (env `SAN_VPN_STATE`) and `--log-level`
 - **IPv4 only, no DNS names.** Use the addresses that `status` shows.
 - **Only the machines running san_vpn are on the network**, not their LANs.
 - **The relay is trusted to say who the members are.** It cannot read traffic,
-  but a compromised relay could add a member of its own.
+  but a compromised relay could add a member of its own. On Cloud Run, the same
+  goes for anyone who can write the bucket, which also holds the relay's key.
+- **Cloud Run support is new.** It has been tested with a fake gcloud, and with
+  the relay's image in Docker against a Cloud Storage emulator. It has not yet
+  run on a real Google Cloud project.

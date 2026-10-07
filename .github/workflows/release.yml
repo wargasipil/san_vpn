@@ -3,8 +3,9 @@
 #   git tag -a v0.2.0 -m "san_vpn v0.2.0" && git push origin v0.2.0
 #
 # The binaries come from build.sh, the same script as a local build, stamped
-# with the tag as their version. A tag with a "-" (v0.2.0-rc1) becomes a
-# prerelease.
+# with the tag as their version. The relay's container image, for Cloud Run,
+# goes to ghcr.io/<owner>/san_vpn:<tag> (and :latest). A tag with a "-"
+# (v0.2.0-rc1) becomes a prerelease, and does not move :latest.
 name: release
 
 on:
@@ -13,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
@@ -39,6 +41,25 @@ jobs:
           (cd dist && sha256sum -- * > SHA256SUMS)
           ./bin/san_vpn --version
 
+      - name: Container image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          image="ghcr.io/${REPO,,}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker build --build-arg VERSION="$TAG" \
+            --label org.opencontainers.image.source="https://github.com/$REPO" \
+            -t "$image:$TAG" .
+          docker run --rm --entrypoint /san_vpn "$image:$TAG" --version
+          docker push "$image:$TAG"
+          if [[ "$TAG" != *-* ]]; then
+            docker tag "$image:$TAG" "$image:latest"
+            docker push "$image:latest"
+          fi
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,6 +72,7 @@ jobs:
           - **Windows**: \`san_vpn-windows-amd64.exe\`. Wintun is built in; \`up\` writes \`wintun.dll\` next to the exe.
           - **Linux**: \`san_vpn-linux-amd64\`, then \`chmod +x\`.
           - Check downloads against \`SHA256SUMS\`.
+          - **Relay on Cloud Run**: image \`ghcr.io/${REPO,,}:$TAG\`, which \`san_vpn setup cloudrun\` deploys.
           EOF
           prerelease=()
           if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi

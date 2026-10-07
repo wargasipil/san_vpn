@@ -42,12 +42,22 @@ type State struct {
 	// Tunnel is the dev tunnel `setup init` put in front of the relay, which
 	// `relay run` hosts. Nil when the relay is fronted some other way.
 	Tunnel *Tunnel `json:"tunnel,omitempty"`
+	// CloudRun is the Cloud Run service `setup cloudrun` runs the relay as.
+	// Nil when the relay runs anywhere else.
+	CloudRun *CloudRun `json:"cloud_run,omitempty"`
 }
 
 // Tunnel names the relay's dev tunnel.
 type Tunnel struct {
 	ID   string `json:"id"`   // as the service reports it, with its region: san-vpn-ab12cd.asse
 	Port int    `json:"port"` // forwarded to 127.0.0.1:Port, where the relay listens
+}
+
+// CloudRun names the relay's Cloud Run service.
+type CloudRun struct {
+	Project string `json:"project"`
+	Region  string `json:"region"`
+	Service string `json:"service"`
 }
 
 // Node is a member.

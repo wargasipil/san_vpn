@@ -327,7 +327,7 @@ func TestCheck(t *testing.T) {
 	if err := state.Update(relayPath, &st, func() error { return st.Init(relay.DefaultNetwork) }); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := relay.New(relayPath, nil)
+	srv, err := relay.New(context.Background(), state.File(relayPath), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +347,7 @@ func TestCheck(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	opts := CheckOptions{RelayPath: relayPath, NodeDir: nodeDir, FindCLI: func() (*devtunnel.CLI, error) { return f.cli(), nil }}
+	opts := CheckOptions{Relay: state.File(relayPath), NodeDir: nodeDir, FindCLI: func() (*devtunnel.CLI, error) { return f.cli(), nil }}
 
 	sections := Check(ctx, opts)
 	if Failed(sections) || len(sections) != 1 {
@@ -371,7 +371,7 @@ func TestCheck(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.Reload(); err != nil {
+	if err := srv.Reload(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := node.Join(ctx, invite.Invite{URL: ts.URL, RelayKey: st.PrivateKey.Public(), ID: inv.ID, Secret: inv.Secret}, nil, nil)
@@ -402,7 +402,7 @@ func TestCheck(t *testing.T) {
 	if err := state.Update(relayPath, &st, func() error { _, err := st.Remove("home"); return err }); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.Reload(); err != nil {
+	if err := srv.Reload(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	text = dump(Check(ctx, opts))
@@ -413,7 +413,7 @@ func TestCheck(t *testing.T) {
 
 func TestCheckNothingSetUp(t *testing.T) {
 	dir := t.TempDir()
-	sections := Check(context.Background(), CheckOptions{RelayPath: filepath.Join(dir, state.RelayFile), NodeDir: dir})
+	sections := Check(context.Background(), CheckOptions{Relay: state.File(filepath.Join(dir, state.RelayFile)), NodeDir: dir})
 	if !Failed(sections) || !strings.Contains(dump(sections), "setup init") {
 		t.Fatalf("%s", dump(sections))
 	}

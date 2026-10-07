@@ -53,7 +53,7 @@ func TestAdminFlow(t *testing.T) {
 		t.Fatalf("second init changed the relay:\n%s\nvs\n%s", out, again)
 	}
 
-	srv, err := relay.New(filepath.Join(relayDir, state.RelayFile), nil)
+	srv, err := relay.New(context.Background(), state.File(filepath.Join(relayDir, state.RelayFile)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestAdminFlow(t *testing.T) {
 func TestJoinURLOverride(t *testing.T) {
 	relayDir, nodeDir := t.TempDir(), t.TempDir()
 	mustRun(t, "--state", relayDir, "relay", "init", "--url", "https://unreachable.invalid")
-	srv, err := relay.New(filepath.Join(relayDir, state.RelayFile), nil)
+	srv, err := relay.New(context.Background(), state.File(filepath.Join(relayDir, state.RelayFile)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

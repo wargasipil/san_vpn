@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,33 +34,47 @@ import (
 func quiet() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 type testRelay struct {
-	path string
-	url  string
-	srv  *relay.Server
+	store    state.Store
+	url      string
+	srv      *relay.Server
+	connects atomic.Int64 // WebSocket connections made, renewals included
 }
 
 func startRelay(t *testing.T, ctx context.Context) *testRelay {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), state.RelayFile)
+	return startRelayOn(t, ctx, state.File(filepath.Join(t.TempDir(), state.RelayFile)))
+}
+
+// startRelayOn runs a relay whose file is in store.
+func startRelayOn(t *testing.T, ctx context.Context, store state.Store) *testRelay {
+	t.Helper()
 	var st relay.State
-	if err := state.Update(path, &st, func() error { return st.Init(relay.DefaultNetwork) }); err != nil {
+	if err := store.Update(ctx, &st, func() error { return st.Init(relay.DefaultNetwork) }); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := relay.New(path, quiet())
+	srv, err := relay.New(ctx, store, quiet())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(srv.Handler())
+	r := &testRelay{store: store, srv: srv}
+	h := srv.Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == wire.ConnectPath {
+			r.connects.Add(1)
+		}
+		h.ServeHTTP(w, req)
+	}))
 	t.Cleanup(ts.Close)
+	r.url = ts.URL
 	go srv.Watch(ctx, 20*time.Millisecond)
-	return &testRelay{path: path, url: ts.URL, srv: srv}
+	return r
 }
 
 func (r *testRelay) invite(t *testing.T, name string) invite.Invite {
 	t.Helper()
 	var st relay.State
 	var inv relay.Invite
-	if err := state.Update(r.path, &st, func() error {
+	if err := r.store.Update(context.Background(), &st, func() error {
 		var err error
 		inv, err = st.NewInvite(name, time.Hour, time.Now())
 		return err
@@ -226,7 +241,7 @@ func TestMeshOverRelay(t *testing.T) {
 	// Removing a member on the relay disconnects it and drops it from
 	// everyone else's peers.
 	var st relay.State
-	if err := state.Update(r.path, &st, func() error { _, err := st.Remove("region"); return err }); err != nil {
+	if err := r.store.Update(ctx, &st, func() error { _, err := st.Remove("region"); return err }); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "home to forget region", func() bool { return !hasPeer(home, "region") })
@@ -286,7 +301,7 @@ func TestRelayRestart(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	serve := func(ln net.Listener) (*relay.Server, *http.Server) {
-		srv, err := relay.New(path, quiet())
+		srv, err := relay.New(context.Background(), state.File(path), quiet())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -296,7 +311,7 @@ func TestRelayRestart(t *testing.T) {
 	}
 	srv1, hs1 := serve(ln)
 
-	r := &testRelay{path: path, url: "http://" + addr}
+	r := &testRelay{store: state.File(path), url: "http://" + addr}
 	a := joinAndStart(t, ctx, r.invite(t, "a"))
 	b := joinAndStart(t, ctx, r.invite(t, "b"))
 	echo(t, b, 7000)

@@ -24,6 +24,9 @@ import (
 const (
 	backoffMin = time.Second
 	backoffMax = 30 * time.Second
+	// renewRetry is the wait between attempts to renew a connection before
+	// the relay's session limit; the old connection carries on meanwhile.
+	renewRetry = 30 * time.Second
 	// writeTimeout bounds one write to the relay; past it the connection is
 	// treated as dead and redialled.
 	writeTimeout = 15 * time.Second
@@ -91,13 +94,23 @@ func New(o Options) (*Node, error) {
 
 // Run keeps the node connected to the relay until ctx ends, then shuts the
 // device down. A lost connection is redialled with backoff; it is never an
-// error, because a relay restart or a network change is ordinary.
+// error, because a relay restart or a network change is ordinary. A
+// connection the relay will end at its session limit is renewed before then,
+// without a gap.
 func (n *Node) Run(ctx context.Context) error {
 	defer n.dev.Close()
 	backoff := backoffMin
 	for {
 		start := time.Now()
-		err := n.session(ctx)
+		l, err := n.connect(ctx, 0)
+		if err == nil {
+			n.log.Info("connected to relay", "relay", n.o.Config.RelayURL, "ip", n.o.Config.IP)
+			n.setConnected(true)
+			for l != nil {
+				l, err = n.session(ctx, l)
+			}
+			n.setConnected(false)
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -145,28 +158,41 @@ func Probe(ctx context.Context, cfg *Config, client *http.Client) error {
 		return err
 	}
 	defer c.CloseNow()
-	if err := handshake(ctx, c, cfg, true); err != nil {
+	if _, err := handshake(ctx, c, cfg, true, 0); err != nil {
 		return err
 	}
 	_ = c.Close(websocket.StatusNormalClosure, "")
 	return nil
 }
 
-// session is one connection to the relay, from dial to failure.
-func (n *Node) session(ctx context.Context) error {
-	cfg := n.o.Config
-	c, err := dial(ctx, cfg, n.o.HTTPClient)
-	if err != nil {
-		return err
-	}
-	defer c.CloseNow()
+// link is a connection to the relay that has passed the handshake.
+type link struct {
+	c *websocket.Conn
+	// renewAfter is when to replace it, as the relay asked; 0 for never.
+	renewAfter time.Duration
+}
 
-	if err := handshake(ctx, c, cfg, false); err != nil {
-		return err
+// connect dials the relay and runs the handshake. resume is the relay
+// connection id being renewed, or 0 for a fresh start.
+func (n *Node) connect(ctx context.Context, resume uint64) (*link, error) {
+	c, err := dial(ctx, n.o.Config, n.o.HTTPClient)
+	if err != nil {
+		return nil, err
 	}
-	n.log.Info("connected to relay", "relay", cfg.RelayURL, "ip", cfg.IP)
-	n.setConnected(true)
-	defer n.setConnected(false)
+	renew, err := handshake(ctx, c, n.o.Config, false, resume)
+	if err != nil {
+		_ = c.CloseNow()
+		return nil, err
+	}
+	return &link{c: c, renewAfter: renew}, nil
+}
+
+// session carries traffic over one connection until it fails, or until a
+// renewal has replaced it; then it returns the new connection to carry on
+// with.
+func (n *Node) session(ctx context.Context, l *link) (*link, error) {
+	c := l.c
+	defer c.CloseNow()
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -174,56 +200,180 @@ func (n *Node) session(ctx context.Context) error {
 	wg.Add(2)
 	go func() { defer wg.Done(); n.writeLoop(sctx, cancel, c) }()
 	go func() { defer wg.Done(); wire.Keepalive(sctx, c, wire.KeepaliveInterval, wire.KeepaliveTimeout) }()
-	defer wg.Wait() // the next session's writer must not race this one's
-	defer cancel()
+	r := n.scheduleRenewal(ctx, l.renewAfter, cancel)
 
+	var err error
+	for err == nil {
+		var typ websocket.MessageType
+		var b []byte
+		if typ, b, err = c.Read(sctx); err == nil {
+			_, err = n.handle(typ, b)
+		}
+	}
+	cancel()
+	wg.Wait() // the next session's writer must not race this one's
+	if next := r.finish(); next != nil {
+		return next, nil
+	}
+	return nil, err
+}
+
+// handle acts on one message from the relay, and says whether it was a
+// member list.
+func (n *Node) handle(typ websocket.MessageType, b []byte) (bool, error) {
+	if typ == websocket.MessageBinary {
+		from, packet, err := wire.SplitFrame(b)
+		if err == nil {
+			n.bind.deliver(from, packet)
+		}
+		return false, nil
+	}
+	m, err := wire.ParseMessage(b)
+	if err != nil {
+		return false, err
+	}
+	switch m.Type {
+	case wire.TypeNetmap:
+		if m.Netmap != nil {
+			n.applyNetmap(m.Netmap)
+			return true, nil
+		}
+	case wire.TypeError:
+		return false, fmt.Errorf("relay: %s", m.Error)
+	}
+	return false, nil
+}
+
+// renewal replaces a connection before the relay's session limit ends it.
+type renewal struct {
+	timer *time.Timer
+	ended chan struct{} // closed by finish: the old connection is gone
+
+	mu      sync.Mutex
+	stopped bool
+	started bool
+	done    chan struct{} // closed when a started renewal has finished
+	next    *link
+}
+
+// scheduleRenewal starts the next connection a little before after, with
+// jitter so members that connected together do not renew together.
+// cancelOld ends the current session once the next one is in place.
+func (n *Node) scheduleRenewal(ctx context.Context, after time.Duration, cancelOld func()) *renewal {
+	r := &renewal{ended: make(chan struct{}), done: make(chan struct{})}
+	if after <= 0 {
+		return r
+	}
+	// Somewhere in the last twentieth before after.
+	r.timer = time.AfterFunc(after-(jitter(after/10)-after/20), func() {
+		r.mu.Lock()
+		if r.stopped {
+			r.mu.Unlock()
+			return
+		}
+		r.started = true
+		r.mu.Unlock()
+		defer close(r.done)
+		r.next = n.renew(ctx, r.ended, cancelOld)
+	})
+	return r
+}
+
+// finish cancels a renewal that has not started, or waits for one that has,
+// and returns the connection it made, if any.
+func (r *renewal) finish() *link {
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.mu.Lock()
+	r.stopped = true
+	started := r.started
+	r.mu.Unlock()
+	if !started {
+		return nil
+	}
+	close(r.ended)
+	<-r.done
+	return r.next
+}
+
+// renew opens the next connection while the current one still carries
+// traffic, and switches once the relay has made it this node's connection --
+// it says so with a member list. Until then both stay open, so no packet waits
+// on a dial. It retries until it succeeds or the current connection is gone.
+func (n *Node) renew(ctx context.Context, ended <-chan struct{}, cancelOld func()) *link {
 	for {
-		typ, b, err := c.Read(sctx)
-		if err != nil {
-			return err
-		}
-		if typ == websocket.MessageBinary {
-			from, packet, err := wire.SplitFrame(b)
-			if err == nil {
-				n.bind.deliver(from, packet)
+		next, err := n.connect(ctx, n.selfConn())
+		if err == nil {
+			if err = n.awaitNetmap(ctx, next.c); err == nil {
+				n.log.Info("renewed the relay connection")
+				cancelOld()
+				return next
 			}
-			continue
+			_ = next.c.CloseNow()
 		}
-		m, err := wire.ParseMessage(b)
-		if err != nil {
-			return err
+		if ctx.Err() != nil {
+			return nil
 		}
-		switch m.Type {
-		case wire.TypeNetmap:
-			if m.Netmap != nil {
-				n.applyNetmap(m.Netmap)
-			}
-		case wire.TypeError:
-			return fmt.Errorf("relay: %s", m.Error)
+		n.log.Warn("renew relay connection", "err", err)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ended:
+			return nil
+		case <-time.After(renewRetry):
 		}
 	}
 }
 
+// awaitNetmap reads a new connection up to the relay's first member list.
+// Packets that arrive before it are delivered as usual.
+func (n *Node) awaitNetmap(ctx context.Context, c *websocket.Conn) error {
+	actx, cancel := context.WithTimeout(ctx, wire.HandshakeTimeout)
+	defer cancel()
+	for {
+		typ, b, err := c.Read(actx)
+		if err != nil {
+			return err
+		}
+		netmap, err := n.handle(typ, b)
+		if err != nil || netmap {
+			return err
+		}
+	}
+}
+
+// selfConn is this node's relay connection id, as the last member list gave it.
+func (n *Node) selfConn() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.netmap == nil {
+		return 0
+	}
+	return n.netmap.Self.Conn
+}
+
 // handshake proves our key to the relay and checks the relay's proof against
-// the key our invite named.
-func handshake(ctx context.Context, c *websocket.Conn, cfg *Config, probe bool) error {
+// the key our invite named. It returns when the relay asks the connection to
+// be renewed.
+func handshake(ctx context.Context, c *websocket.Conn, cfg *Config, probe bool, resume uint64) (time.Duration, error) {
 	hctx, cancel := context.WithTimeout(ctx, wire.HandshakeTimeout)
 	defer cancel()
 
 	ch, err := wire.ReadMessage(hctx, c)
 	if err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return 0, fmt.Errorf("handshake: %w", err)
 	}
 	if ch.Type != wire.TypeChallenge || len(ch.Nonce) != wire.NonceSize {
-		return errors.New("handshake: relay did not send a challenge")
+		return 0, errors.New("handshake: relay did not send a challenge")
 	}
 	nonce := make([]byte, wire.NonceSize)
 	if _, err := rand.Read(nonce); err != nil {
-		return err
+		return 0, err
 	}
 	shared, err := cfg.PrivateKey.Shared(cfg.RelayKey)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	pub := cfg.PrivateKey.Public()
 	auth := wire.Message{
@@ -233,23 +383,24 @@ func handshake(ctx context.Context, c *websocket.Conn, cfg *Config, probe bool) 
 		Version:   wire.ProtocolVersion,
 		Proof:     wire.Proof(shared, wire.RoleNode, ch.Nonce, nonce),
 		Probe:     probe,
+		Resume:    resume,
 	}
 	if err := wire.WriteMessage(hctx, c, auth); err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return 0, fmt.Errorf("handshake: %w", err)
 	}
 
 	w, err := wire.ReadMessage(hctx, c)
 	if err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return 0, fmt.Errorf("handshake: %w", err)
 	}
 	if w.Type == wire.TypeError {
-		return fmt.Errorf("relay refused us: %s", w.Error)
+		return 0, fmt.Errorf("relay refused us: %s", w.Error)
 	}
 	if w.Type != wire.TypeWelcome || !hmac.Equal(w.Proof, wire.Proof(shared, wire.RoleRelay, ch.Nonce, nonce)) {
 		// Whatever answered does not hold the relay key from our invite.
-		return errors.New("handshake: the relay could not prove it is the relay this node joined")
+		return 0, errors.New("handshake: the relay could not prove it is the relay this node joined")
 	}
-	return nil
+	return time.Duration(w.RenewAfterMs) * time.Millisecond, nil
 }
 
 func (n *Node) writeLoop(ctx context.Context, cancel context.CancelFunc, c *websocket.Conn) {

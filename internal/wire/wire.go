@@ -88,9 +88,21 @@ type Message struct {
 	// the node's connection: `setup check` can test a member's key while
 	// that member's `up` stays connected.
 	Probe bool `json:"probe,omitempty"`
+	// Resume is set when a node renews a connection that is still up: the
+	// relay connection id it had (its Conn in the netmap). The relay gives
+	// the new connection the same id, so peers see a node that carried on,
+	// not one that restarted, and keep their WireGuard sessions with it.
+	Resume uint64 `json:"resume,omitempty"`
 
 	// Auth and Welcome.
 	Proof []byte `json:"proof,omitempty"`
+
+	// Welcome: when the node should open its next connection, in
+	// milliseconds, because something in front of the relay cuts connections
+	// at a fixed age -- Cloud Run ends every request after its timeout, at
+	// most an hour. Zero means connections may live forever. Old nodes ignore
+	// it and simply reconnect when cut.
+	RenewAfterMs int64 `json:"renew_after_ms,omitempty"`
 
 	// Netmap.
 	Netmap *Netmap `json:"netmap,omitempty"`
@@ -180,6 +192,16 @@ const NonceSize = 32
 
 // HandshakeTimeout bounds each side's wait for the other's handshake message.
 const HandshakeTimeout = 15 * time.Second
+
+// RenewAfter is when a node should replace a connection that the relay will
+// end at limit: a tenth of the way before, at most five minutes before. That
+// leaves time to retry a renewal that fails.
+func RenewAfter(limit time.Duration) time.Duration {
+	if limit <= 0 {
+		return 0
+	}
+	return limit - min(limit/10, 5*time.Minute)
+}
 
 // EncodeSecret and DecodeSecret give secrets a printable form.
 func EncodeSecret(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

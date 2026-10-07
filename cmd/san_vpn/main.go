@@ -55,7 +55,7 @@ func root(out io.Writer) *cli.Command {
 		Writer:  out,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "log-level", Value: "info", Sources: cli.EnvVars("SAN_VPN_LOG_LEVEL"), Usage: "debug, info, warn or error"},
-			&cli.StringFlag{Name: "state", Sources: cli.EnvVars("SAN_VPN_STATE"), Usage: "state directory (default: the user config dir for the relay, " + state.NodeDir() + " for a node)"},
+			&cli.StringFlag{Name: "state", Sources: cli.EnvVars("SAN_VPN_STATE"), Usage: "state directory (default: the user config dir for the relay, " + state.NodeDir() + " for a node); for the relay also gs://<bucket>[/<folder>]"},
 		},
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			// Logs go to stderr, always: stdout carries invites and tables
@@ -94,8 +94,9 @@ func relayCommand() *cli.Command {
 				Name:  "run",
 				Usage: "serve the relay",
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "listen", Value: "127.0.0.1:8443", Usage: "address to listen on; put TLS (a dev tunnel, Caddy) in front. Default: the dev tunnel's port when setup init made one"},
+					&cli.StringFlag{Name: "listen", Value: "127.0.0.1:8443", Usage: "address to listen on; put TLS (a dev tunnel, Caddy) in front. Default: the dev tunnel's port when setup init made one, else :$PORT when PORT is set (Cloud Run)"},
 					&cli.BoolFlag{Name: "no-tunnel", Usage: "do not host the dev tunnel from setup init (host it yourself, or front the relay another way)"},
+					&cli.DurationFlag{Name: "session-limit", Sources: cli.EnvVars("SAN_VPN_SESSION_LIMIT"), Usage: "end each member connection after this long, and have members renew it first; set it to Cloud Run's request timeout (0: no limit)"},
 				},
 				Action: runRelay,
 			},
@@ -124,19 +125,39 @@ func relayCommand() *cli.Command {
 	}
 }
 
-func relayPath(cmd *cli.Command) (string, error) {
+// relayStore is where the relay's file lives: --state, a local directory or
+// a gs:// bucket, else the user config dir.
+func relayStore(cmd *cli.Command) (state.Store, error) {
 	dir := cmd.String("state")
 	if dir == "" {
 		var err error
 		if dir, err = state.RelayDir(); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
-	return filepath.Join(dir, state.RelayFile), nil
+	return state.Open(dir, state.RelayFile)
 }
 
-func runRelayInit(_ context.Context, cmd *cli.Command) error {
-	path, err := relayPath(cmd)
+// relayPath is the relay's file for commands that only work on local disk.
+func relayPath(cmd *cli.Command, what string) (string, error) {
+	store, err := relayStore(cmd)
+	if err != nil {
+		return "", err
+	}
+	f, ok := store.(state.File)
+	if !ok {
+		return "", fmt.Errorf("%s works on a relay on this machine, not one kept in %s", what, store)
+	}
+	return string(f), nil
+}
+
+// errNoRelay is a relay store that `relay init` never filled.
+func errNoRelay(store state.Store) error {
+	return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", store)
+}
+
+func runRelayInit(ctx context.Context, cmd *cli.Command) error {
+	store, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
@@ -150,13 +171,16 @@ func runRelayInit(_ context.Context, cmd *cli.Command) error {
 			return err
 		}
 	}
-	if err := state.EnsureDir(filepath.Dir(path), false); err != nil {
-		return err
+	if f, ok := store.(state.File); ok {
+		if err := state.EnsureDir(filepath.Dir(string(f)), false); err != nil {
+			return err
+		}
 	}
 
 	var st relay.State
 	created := false
-	err = state.Update(path, &st, func() error {
+	err = store.Update(ctx, &st, func() error {
+		created = false
 		if st.PrivateKey.IsZero() {
 			created = true
 			if err := st.Init(network); err != nil {
@@ -181,9 +205,9 @@ func runRelayInit(_ context.Context, cmd *cli.Command) error {
 
 	w := cmd.Root().Writer
 	if created {
-		fmt.Fprintf(w, "created relay %s\n", path)
+		fmt.Fprintf(w, "created relay %s\n", store)
 	} else {
-		fmt.Fprintf(w, "updated relay %s\n", path)
+		fmt.Fprintf(w, "updated relay %s\n", store)
 	}
 	fmt.Fprintf(w, "  key      %s\n  network  %s\n  url      %s\n", st.PrivateKey.Public(), st.Network, orNone(st.URL))
 	if st.URL == "" {
@@ -193,22 +217,38 @@ func runRelayInit(_ context.Context, cmd *cli.Command) error {
 }
 
 func runRelay(ctx context.Context, cmd *cli.Command) error {
-	path, err := relayPath(cmd)
+	store, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 	log := slog.Default()
-	srv, err := relay.New(path, log)
+	srv, err := relay.New(ctx, store, log)
 	if err != nil {
 		return err
 	}
-	go srv.Watch(ctx, time.Second)
+	limit := cmd.Duration("session-limit")
+	srv.SetSessionLimit(limit)
+	if limit == 0 && os.Getenv("K_SERVICE") != "" {
+		log.Warn("on Cloud Run, set SAN_VPN_SESSION_LIMIT to the service's request timeout, so members renew their connections before Cloud Run cuts them")
+	}
+	// A file beside the relay is cheap to look at every second. Cloud
+	// Storage charges per request and admin changes are rare, so poll it
+	// less often: an invite or a removal takes effect within five seconds.
+	every := time.Second
+	if state.Remote(store) {
+		every = 5 * time.Second
+	}
+	go srv.Watch(ctx, every)
 
 	var st relay.State
-	_ = state.Read(path, &st)
+	_, _ = store.Read(ctx, &st)
 	listen := cmd.String("listen")
-	if st.Tunnel != nil && !cmd.IsSet("listen") {
+	switch {
+	case cmd.IsSet("listen"):
+	case st.Tunnel != nil:
 		listen = fmt.Sprintf("127.0.0.1:%d", st.Tunnel.Port)
+	case os.Getenv("PORT") != "":
+		listen = ":" + os.Getenv("PORT") // Cloud Run and similar hosts say where to listen
 	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -223,7 +263,7 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 		_ = hs.Shutdown(sctx)
 	}()
 
-	log.Info("relay listening", "addr", ln.Addr().String(), "url", orNone(st.URL), "key", srv.PublicKey(), "state", path)
+	log.Info("relay listening", "addr", ln.Addr().String(), "url", orNone(st.URL), "key", srv.PublicKey(), "state", store.String(), "session_limit", limit)
 	if st.URL == "" {
 		log.Warn("no public URL set, so invites cannot be made yet; run `san_vpn setup init` (dev tunnel) or `san_vpn relay init --url ...`")
 	}
@@ -248,22 +288,22 @@ func hostTunnel(ctx context.Context, t *relay.Tunnel, log *slog.Logger) {
 	go devtunnel.New(p, nil, io.Discard, io.Discard).Host(ctx, t.ID, log)
 }
 
-func runRelayInvite(_ context.Context, cmd *cli.Command) error {
+func runRelayInvite(ctx context.Context, cmd *cli.Command) error {
 	name := cmd.Args().First()
 	if name == "" || cmd.Args().Len() > 1 {
 		return errors.New("usage: san_vpn relay invite <name>")
 	}
-	path, err := relayPath(cmd)
+	store, err := relayStore(cmd)
 	if err != nil {
 		return err
-	}
-	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", path)
 	}
 
 	var st relay.State
 	var inv relay.Invite
-	err = state.Update(path, &st, func() error {
+	err = store.Update(ctx, &st, func() error {
+		if st.PrivateKey.IsZero() {
+			return errNoRelay(store)
+		}
 		if st.URL == "" {
 			return errors.New("the relay has no public URL; set it with `san_vpn relay init --url <https://...>`")
 		}
@@ -287,15 +327,15 @@ func runRelayInvite(_ context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func runRelayList(_ context.Context, cmd *cli.Command) error {
-	path, err := relayPath(cmd)
+func runRelayList(ctx context.Context, cmd *cli.Command) error {
+	store, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 	var st relay.State
-	if err := state.Read(path, &st); err != nil {
+	if _, err := store.Read(ctx, &st); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", path)
+			return errNoRelay(store)
 		}
 		return err
 	}
@@ -344,35 +384,42 @@ func runRelayList(_ context.Context, cmd *cli.Command) error {
 	return tw.Flush()
 }
 
-func runRelayRemove(_ context.Context, cmd *cli.Command) error {
+func runRelayRemove(ctx context.Context, cmd *cli.Command) error {
 	name := cmd.Args().First()
 	if name == "" || cmd.Args().Len() > 1 {
 		return errors.New("usage: san_vpn relay remove <name>")
 	}
-	path, err := relayPath(cmd)
+	store, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 	var st relay.State
 	var what string
-	if err := state.Update(path, &st, func() error {
+	if err := store.Update(ctx, &st, func() error {
+		if st.PrivateKey.IsZero() {
+			return errNoRelay(store)
+		}
 		var err error
 		what, err = st.Remove(name)
 		return err
 	}); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.Root().Writer, "removed %s %q; a running relay disconnects it within a second\n", what, name)
+	fmt.Fprintf(cmd.Root().Writer, "removed %s %q; a running relay disconnects it within seconds\n", what, name)
 	return nil
 }
 
 // ------------------------------------------------------------------ node ---
 
-func nodeDir(cmd *cli.Command) (dir string, isDefault bool) {
-	if d := cmd.String("state"); d != "" {
-		return d, false
+func nodeDir(cmd *cli.Command) (dir string, isDefault bool, err error) {
+	d := cmd.String("state")
+	if strings.HasPrefix(d, "gs://") {
+		return "", false, fmt.Errorf("--state %s: a member keeps its key on its own disk; gs:// is for the relay", d)
 	}
-	return state.NodeDir(), true
+	if d != "" {
+		return d, false, nil
+	}
+	return state.NodeDir(), true, nil
 }
 
 // requireAdmin stops early, with the fix in the message, rather than failing
@@ -422,7 +469,10 @@ func runJoin(ctx context.Context, cmd *cli.Command) error {
 		headers = nil
 	}
 
-	dir, isDefault := nodeDir(cmd)
+	dir, isDefault, err := nodeDir(cmd)
+	if err != nil {
+		return err
+	}
 	if isDefault {
 		if err := requireAdmin("san_vpn join"); err != nil {
 			return err
@@ -471,7 +521,10 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 	if err := requireAdmin("san_vpn up"); err != nil {
 		return err
 	}
-	dir, _ := nodeDir(cmd)
+	dir, _, err := nodeDir(cmd)
+	if err != nil {
+		return err
+	}
 	var cfg node.Config
 	if err := state.Load(filepath.Join(dir, state.NodeFile), &cfg); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -548,10 +601,13 @@ func statusCommand() *cli.Command {
 const staleAfter = 10 * time.Second
 
 func runStatus(_ context.Context, cmd *cli.Command) error {
-	dir, _ := nodeDir(cmd)
+	dir, _, err := nodeDir(cmd)
+	if err != nil {
+		return err
+	}
 	w := cmd.Root().Writer
 	var st node.Status
-	err := state.Load(filepath.Join(dir, state.StatusFile), &st)
+	err = state.Load(filepath.Join(dir, state.StatusFile), &st)
 	if errors.Is(err, os.ErrNotExist) {
 		// Not running; say whether it has joined at all.
 		var cfg node.Config

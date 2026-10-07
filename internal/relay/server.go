@@ -15,6 +15,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -37,17 +38,18 @@ const (
 
 // Server is a running relay.
 type Server struct {
-	path string
-	log  *slog.Logger
-	now  func() time.Time
+	store state.Store
+	log   *slog.Logger
+	now   func() time.Time
 
 	mu       sync.RWMutex
 	priv     wire.Key
 	network  netip.Prefix
 	members  map[wire.Key]Node
 	sessions map[wire.Key]*session
-	modTime  time.Time
+	version  string
 	closing  bool
+	limit    time.Duration // 0: sessions may last forever
 
 	handlers sync.WaitGroup // connect handlers still running
 }
@@ -58,18 +60,32 @@ type session struct {
 	data   chan []byte
 	netmap chan struct{}
 	kick   chan string
+	// renewed is set when the node replaced this connection with a renewal:
+	// routine, hourly on Cloud Run, so not worth an info line.
+	renewed atomic.Bool
 }
 
-// New loads the relay at path, which `relay init` must have created.
-func New(path string, log *slog.Logger) (*Server, error) {
+// New loads the relay from store, which `relay init` must have filled.
+func New(ctx context.Context, store state.Store, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	s := &Server{path: path, log: log, now: time.Now, sessions: map[wire.Key]*session{}}
-	if err := s.Reload(); err != nil {
+	s := &Server{store: store, log: log, now: time.Now, sessions: map[wire.Key]*session{}}
+	if err := s.Reload(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// SetSessionLimit makes the relay end every connection after d, and tell
+// nodes to open their next one before that. It is for fronts that cut
+// connections at a fixed age -- Cloud Run ends each request at its timeout --
+// so that nodes move to a new connection on their own schedule, without a
+// gap, instead of being cut. Zero, the default, means no limit.
+func (s *Server) SetSessionLimit(d time.Duration) {
+	s.mu.Lock()
+	s.limit = d
+	s.mu.Unlock()
 }
 
 // PublicKey is the relay's key, as invites carry it.
@@ -79,28 +95,19 @@ func (s *Server) PublicKey() wire.Key {
 	return s.priv.Public()
 }
 
-// Reload rereads the state file, then disconnects nodes that are no longer
+// Reload rereads the state, then disconnects nodes that are no longer
 // members and sends everyone else the new member list.
-func (s *Server) Reload() error {
+func (s *Server) Reload(ctx context.Context) error {
 	var st State
-	unlock, err := state.Lock(s.path)
-	if err != nil {
-		return err
-	}
-	err = state.Load(s.path, &st)
-	fi, serr := os.Stat(s.path)
-	unlock()
+	version, err := s.store.Read(ctx, &st)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", s.path)
+		return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", s.store)
 	}
 	if err != nil {
 		return err
-	}
-	if serr != nil {
-		return serr
 	}
 	if st.PrivateKey.IsZero() || !st.Network.IsValid() {
-		return fmt.Errorf("%s has no key or network; run `san_vpn relay init`", s.path)
+		return fmt.Errorf("%s has no key or network; run `san_vpn relay init`", s.store)
 	}
 
 	members := make(map[wire.Key]Node, len(st.Nodes))
@@ -112,7 +119,7 @@ func (s *Server) Reload() error {
 	s.priv = st.PrivateKey
 	s.network = st.Network
 	s.members = members
-	s.modTime = fi.ModTime()
+	s.version = version
 	for k, sess := range s.sessions {
 		if _, ok := members[k]; !ok {
 			kick(sess, "removed from the network")
@@ -125,26 +132,35 @@ func (s *Server) Reload() error {
 	return nil
 }
 
-// Watch reloads whenever the state file changes, until ctx ends. This is how
-// `relay invite` and `relay remove`, run beside a live relay, take effect.
+// Watch reloads whenever the state changes, until ctx ends. This is how
+// `relay invite` and `relay remove` take effect on a live relay: run beside
+// it on the same file, or from anywhere against its Cloud Storage object.
 func (s *Server) Watch(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
+	failing := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		fi, err := os.Stat(s.path)
+		version, err := s.store.Version(ctx)
 		if err != nil {
+			// A remote store can be briefly unreachable; say so once, not
+			// every tick, and keep serving what we have.
+			if !failing && ctx.Err() == nil {
+				s.log.Warn("check state", "err", err)
+			}
+			failing = true
 			continue
 		}
+		failing = false
 		s.mu.RLock()
-		changed := !fi.ModTime().Equal(s.modTime)
+		changed := version != s.version
 		s.mu.RUnlock()
 		if changed {
-			if err := s.Reload(); err != nil {
+			if err := s.Reload(ctx); err != nil {
 				s.log.Warn("reload state", "err", err)
 			}
 		}
@@ -171,7 +187,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	var st State
 	var node Node
-	err := state.Update(s.path, &st, func() error {
+	err := s.store.Update(r.Context(), &st, func() error {
 		var err error
 		node, err = st.Join(req, s.now())
 		return err
@@ -191,7 +207,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.log.Info("node joined", "name", node.Name, "ip", node.IP, "key", node.PublicKey)
-	if err := s.Reload(); err != nil {
+	if err := s.Reload(r.Context()); err != nil {
 		s.log.Warn("reload after join", "err", err)
 	}
 	writeJoin(w, http.StatusOK, wire.JoinResponse{Name: node.Name, IP: node.IP, Network: st.Network})
@@ -245,12 +261,20 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		netmap: make(chan struct{}, 1),
 		kick:   make(chan string, 1),
 	}
-	if !s.attach(sess) {
+	if !s.attach(sess, auth.Resume) {
 		reject(ctx, c, "relay is shutting down")
 		return
 	}
 	defer s.detach(sess)
-	log.Info("node connected", "remote", r.RemoteAddr)
+	if auth.Resume != 0 {
+		log.Debug("node renewed its connection", "remote", r.RemoteAddr)
+	} else {
+		log.Info("node connected", "remote", r.RemoteAddr)
+	}
+	if limit := s.sessionLimit(); limit > 0 {
+		t := time.AfterFunc(limit, func() { kick(sess, "session limit reached") })
+		defer t.Stop()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -270,7 +294,11 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	cancel()
 	wg.Wait()
-	log.Info("node disconnected")
+	if sess.renewed.Load() {
+		log.Debug("renewed connection closed")
+	} else {
+		log.Info("node disconnected")
+	}
 }
 
 // errNoAuth is a connection that ended before its auth message arrived.
@@ -316,7 +344,11 @@ func (s *Server) handshake(ctx context.Context, c *websocket.Conn) (wire.Key, wi
 	if !hmac.Equal(auth.Proof, wire.Proof(shared, wire.RoleNode, relayNonce, auth.Nonce)) {
 		return wire.Key{}, auth, errors.New("proof does not match the node's key")
 	}
-	welcome := wire.Message{Type: wire.TypeWelcome, Proof: wire.Proof(shared, wire.RoleRelay, relayNonce, auth.Nonce)}
+	welcome := wire.Message{
+		Type:         wire.TypeWelcome,
+		Proof:        wire.Proof(shared, wire.RoleRelay, relayNonce, auth.Nonce),
+		RenewAfterMs: wire.RenewAfter(s.sessionLimit()).Milliseconds(),
+	}
 	if err := wire.WriteMessage(ctx, c, welcome); err != nil {
 		return wire.Key{}, wire.Message{}, err
 	}
@@ -331,15 +363,21 @@ func reject(ctx context.Context, c *websocket.Conn, reason string) {
 }
 
 // attach registers a session. A second connection with the same key replaces
-// the first: that is a node that restarted before the relay noticed the old
-// connection was dead, and the new one is the one that works.
-func (s *Server) attach(sess *session) bool {
+// the first: either a node that restarted before the relay noticed the old
+// connection was dead, and the new one is the one that works, or a node
+// renewing its connection before the session limit. The renewing node names
+// the connection it is replacing, and keeps its id.
+func (s *Server) attach(sess *session, resume uint64) bool {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		return false
 	}
 	if old := s.sessions[sess.key]; old != nil {
+		if resume != 0 && old.id == resume {
+			sess.id = old.id
+			old.renewed.Store(true)
+		}
 		kick(old, "replaced by a newer connection")
 	}
 	s.sessions[sess.key] = sess
@@ -447,7 +485,9 @@ func (s *Server) writeLoop(ctx context.Context, cancel context.CancelFunc, c *we
 		case <-ctx.Done():
 			return
 		case reason := <-sess.kick:
-			log.Info("disconnecting node", "reason", reason)
+			if !sess.renewed.Load() {
+				log.Info("disconnecting node", "reason", reason)
+			}
 			reject(ctx, c, reason)
 			return
 		case <-sess.netmap:
@@ -481,6 +521,12 @@ func (s *Server) netmapFor(key wire.Key) *wire.Netmap {
 	}
 	slices.SortFunc(nm.Peers, func(a, b wire.Peer) int { return a.IP.Compare(b.IP) })
 	return nm
+}
+
+func (s *Server) sessionLimit() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.limit
 }
 
 func (s *Server) nameOf(key wire.Key) string {

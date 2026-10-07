@@ -62,8 +62,9 @@ func Failed(sections []Section) bool {
 
 // CheckOptions configure Check.
 type CheckOptions struct {
-	RelayPath string
-	NodeDir   string
+	// Relay is where the relay's file would be; nil checks no relay.
+	Relay   state.Store
+	NodeDir string
 	// FindCLI locates devtunnel; it is only called for a relay with a tunnel.
 	FindCLI    func() (*devtunnel.CLI, error)
 	HTTPClient *http.Client
@@ -96,9 +97,12 @@ func Check(ctx context.Context, o CheckOptions) []Section {
 }
 
 func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
-	s := Section{Title: "relay", Path: o.RelayPath}
+	if o.Relay == nil {
+		return Section{}, false
+	}
+	s := Section{Title: "relay", Path: o.Relay.String()}
 	var st relay.State
-	if err := state.Read(o.RelayPath, &st); err != nil {
+	if _, err := o.Relay.Read(ctx, &st); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return s, false
 		}
@@ -106,6 +110,15 @@ func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
 		return s, true
 	}
 	s.add(OK, "", "relay key %s, network %s, %d member(s)", st.PrivateKey.Public(), st.Network, len(st.Nodes))
+
+	if state.Remote(o.Relay) {
+		// The relay runs elsewhere, on Cloud Run or another host sharing the
+		// bucket: only its public side can be checked from here.
+		if c := st.CloudRun; c != nil {
+			s.add(OK, "", "runs on Cloud Run: service %s, region %s, project %s", c.Service, c.Region, c.Project)
+		}
+		return checkPublic(ctx, o, s, &st, true)
+	}
 
 	port := DefaultPort
 	hosted := true // unknown without a tunnel; do not blame it
@@ -127,6 +140,11 @@ func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
 		s.add(OK, "", "relay answers on %s", local)
 	}
 
+	return checkPublic(ctx, o, s, &st, hosted)
+}
+
+// checkPublic checks the relay where members reach it: its public URL.
+func checkPublic(ctx context.Context, o CheckOptions, s Section, st *relay.State, hosted bool) (Section, bool) {
 	if st.URL == "" {
 		s.add(Fail, "san_vpn setup init (or relay init --url)", "relay has no public URL, so invites cannot be made")
 		return s, true
