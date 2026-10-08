@@ -36,6 +36,7 @@ jobs:
           mkdir dist
           cp bin/san_vpn.exe dist/san_vpn-windows-amd64.exe
           cp bin/san_vpn dist/san_vpn-linux-amd64
+          cp bin/san_vpn-linux-arm64 bin/san_vpn-linux-arm dist/
           # The Windows binary embeds wintun.dll; its license travels with it.
           cp internal/osnet/wintun/LICENSE.txt dist/wintun-LICENSE.txt
           (cd dist && sha256sum -- * > SHA256SUMS)
@@ -71,6 +72,7 @@ jobs:
 
           - **Windows**: \`san_vpn-windows-amd64.exe\`. Wintun is built in; \`up\` writes \`wintun.dll\` next to the exe.
           - **Linux**: \`san_vpn-linux-amd64\`, then \`chmod +x\`.
+          - **Raspberry Pi**: \`san_vpn-linux-arm64\` when \`uname -m\` says \`aarch64\`, \`san_vpn-linux-arm\` when it says \`armv6l\` or \`armv7l\`; then \`chmod +x\`.
           - Check downloads against \`SHA256SUMS\`.
           - **Relay on Cloud Run**: image \`ghcr.io/${REPO,,}:$TAG\`, which \`san_vpn setup cloudrun\` deploys.
           EOF

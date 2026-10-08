@@ -224,6 +224,12 @@ func TestAssetName(t *testing.T) {
 	if n, _ := AssetName("linux", "amd64"); n != "san_vpn-linux-amd64" {
 		t.Error(n)
 	}
+	if n, _ := AssetName("linux", "arm64"); n != "san_vpn-linux-arm64" {
+		t.Error(n)
+	}
+	if n, _ := AssetName("linux", "arm"); n != "san_vpn-linux-arm" {
+		t.Error(n)
+	}
 	if _, err := AssetName("darwin", "arm64"); err == nil {
 		t.Error("no error for a platform without a release binary")
 	}

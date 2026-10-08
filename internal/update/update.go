@@ -81,13 +81,18 @@ func (c *Client) Latest(ctx context.Context) (string, error) {
 }
 
 // AssetName is the release file for an OS and architecture, as the release
-// workflow names it.
+// workflow names it. Linux on ARM is for the Raspberry Pi: arm64 for a 64-bit
+// OS, arm for a 32-bit one, built for ARMv6 so it runs on every Pi.
 func AssetName(goos, goarch string) (string, error) {
 	switch goos + "/" + goarch {
 	case "windows/amd64":
 		return "san_vpn-windows-amd64.exe", nil
 	case "linux/amd64":
 		return "san_vpn-linux-amd64", nil
+	case "linux/arm64":
+		return "san_vpn-linux-arm64", nil
+	case "linux/arm":
+		return "san_vpn-linux-arm", nil
 	}
 	return "", fmt.Errorf("releases have no binary for %s/%s; build san_vpn from source", goos, goarch)
 }

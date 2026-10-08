@@ -1,5 +1,6 @@
 #!/usr/bin/env pwsh
-# Fetch Wintun, vet, test, then build bin/san_vpn.exe (Windows) and bin/san_vpn (Linux).
+# Fetch Wintun, vet, test, then build bin/san_vpn.exe (Windows), bin/san_vpn (Linux)
+# and bin/san_vpn-linux-arm64, bin/san_vpn-linux-arm (Linux on ARM, e.g. a Raspberry Pi).
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -49,11 +50,24 @@ try {
     go build -trimpath -ldflags $ldflags -o bin/san_vpn ./cmd/san_vpn
     if ($LASTEXITCODE -ne 0) { throw "linux build failed" }
 
-    Write-Host "built bin/san_vpn.exe and bin/san_vpn ($version)"
+    # A 64-bit Raspberry Pi OS, and a 32-bit one. ARMv6 runs on every Pi,
+    # the Pi 1 and Zero included; ARMv7 would leave those out.
+    Write-Host "build linux/arm64..."
+    $env:GOARCH = "arm64"
+    go build -trimpath -ldflags $ldflags -o bin/san_vpn-linux-arm64 ./cmd/san_vpn
+    if ($LASTEXITCODE -ne 0) { throw "linux/arm64 build failed" }
+
+    Write-Host "build linux/arm (ARMv6)..."
+    $env:GOARCH = "arm"; $env:GOARM = "6"
+    go build -trimpath -ldflags $ldflags -o bin/san_vpn-linux-arm ./cmd/san_vpn
+    if ($LASTEXITCODE -ne 0) { throw "linux/arm build failed" }
+
+    Write-Host "built bin/san_vpn.exe, bin/san_vpn, bin/san_vpn-linux-arm64 and bin/san_vpn-linux-arm ($version)"
 }
 finally {
     Remove-Item Env:GOOS -ErrorAction SilentlyContinue
     Remove-Item Env:GOARCH -ErrorAction SilentlyContinue
+    Remove-Item Env:GOARM -ErrorAction SilentlyContinue
     Remove-Item Env:CGO_ENABLED -ErrorAction SilentlyContinue
     Pop-Location
 }

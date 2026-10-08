@@ -144,8 +144,8 @@ var (
 
 // DownloadURL is Microsoft's direct link to the Windows CLI, the way in where
 // winget is missing (Windows Server, LTSC, older Windows 10) or fails. There
-// is no arm64 build behind it. san_vpn ships for amd64 only, and Windows on
-// Arm runs both under emulation.
+// is no arm64 build behind it. san_vpn ships Windows for amd64 only, and
+// Windows on Arm runs both under emulation.
 const DownloadURL = "https://aka.ms/TunnelsCliDownload/win-x64"
 
 // downloadPath is where Install puts a downloaded CLI: per user, like the

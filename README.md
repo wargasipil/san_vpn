@@ -27,11 +27,18 @@ in the parent repository.
 ## Download
 
 Each [release](https://github.com/wargasipil/san_vpn/releases) has one file
-per OS, plus `SHA256SUMS`:
+per OS and processor, plus `SHA256SUMS`:
 
 ```sh
 # Linux
 curl -fsSLo san_vpn https://github.com/wargasipil/san_vpn/releases/latest/download/san_vpn-linux-amd64
+chmod +x san_vpn
+```
+
+```sh
+# Raspberry Pi: san_vpn-linux-arm64 when `uname -m` says aarch64,
+# san_vpn-linux-arm when it says armv6l or armv7l
+curl -fsSLo san_vpn https://github.com/wargasipil/san_vpn/releases/latest/download/san_vpn-linux-arm64
 chmod +x san_vpn
 ```
 
@@ -72,6 +79,10 @@ git push origin v0.2.0
 pwsh build.ps1      # Windows: fetch Wintun, vet, test, build bin/san_vpn.exe and bin/san_vpn
 bash build.sh       # Linux: the same
 ```
+
+Both also build `bin/san_vpn-linux-arm64` and `bin/san_vpn-linux-arm` for
+Linux on ARM, such as a Raspberry Pi. The 32-bit one targets ARMv6, so it runs
+on every Pi, the Pi 1 and Zero included.
 
 The Windows binary embeds `wintun.dll` (the tunnel driver from
 [wintun.net](https://www.wintun.net)). The build script downloads it once into
