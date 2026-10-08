@@ -122,6 +122,12 @@ restarting it if it drops. Stopping the relay stops the tunnel host too, even
 if the relay is killed. Use the same user account as `setup init`, because
 the dev tunnels sign-in is per user.
 
+That sign-in lasts only several days. When it expires, the tunnel goes offline
+and the relay logs `the dev tunnel is offline: its sign-in is no longer valid`.
+Sign in again on the relay machine with `devtunnel user login -g` (or rerun
+`san_vpn setup init`). Hosting resumes within 15 seconds; the relay keeps
+running.
+
 **3. Invite each machine** (on the relay machine):
 
 ```powershell

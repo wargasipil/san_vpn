@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -51,6 +52,13 @@ func (l *lines) count(sub string) int {
 	return n
 }
 
+// signedIn answers `user show` with the status in *status.
+func signedIn(status *atomic.Value) Runner {
+	return func(context.Context, string, []string) ([]byte, []byte, int, error) {
+		return []byte(`{"status": "` + status.Load().(string) + `", "provider": "github", "username": "vaziria"}`), nil, 0, nil
+	}
+}
+
 // A host that exits is started again, its output is logged, and cancelling
 // stops it for good.
 func TestHostRestartsAndStops(t *testing.T) {
@@ -59,7 +67,9 @@ func TestHostRestartsAndStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SAN_VPN_FAKE_DEVTUNNEL", "50ms")
-	cli := &CLI{Path: exe}
+	var status atomic.Value
+	status.Store("Logged in")
+	cli := &CLI{Path: exe, Run: signedIn(&status)}
 	l := &lines{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,6 +91,63 @@ func TestHostRestartsAndStops(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Host did not return after cancel")
+	}
+}
+
+// With the sign-in expired, the host is not restarted over and over: Host
+// says so once, waits, and hosts again as soon as someone signs in.
+func TestHostWaitsForSignIn(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SAN_VPN_FAKE_DEVTUNNEL", "10ms")
+	old := signInPoll
+	signInPoll = 20 * time.Millisecond
+	var status atomic.Value
+	status.Store("Login token expired")
+	cli := &CLI{Path: exe, Run: signedIn(&status)}
+	l := &lines{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); cli.Host(ctx, "san-vpn-test01.asse", slog.New(l)) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("Host did not return after cancel")
+		}
+		signInPoll = old
+	})
+
+	waitFor := func(sub string, n int) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for l.count(sub) < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("no %q; log: %v", sub, l.got)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitFor("sign-in is no longer valid", 1)
+	time.Sleep(200 * time.Millisecond) // ten polls
+	if n := l.count("sign-in is no longer valid"); n != 1 {
+		t.Fatalf("said %d times that the sign-in expired; log: %v", n, l.got)
+	}
+	if n := l.count("args=host"); n != 1 {
+		t.Fatalf("host started %d times while signed out; log: %v", n, l.got)
+	}
+	if n := l.count("exited; restarting"); n != 0 {
+		t.Fatalf("restarted while signed out; log: %v", l.got)
+	}
+
+	status.Store("Logged in")
+	waitFor("args=host", 2)
+	if l.count("signed in to dev tunnels again") != 1 {
+		t.Fatalf("no word that hosting resumed; log: %v", l.got)
 	}
 }
 

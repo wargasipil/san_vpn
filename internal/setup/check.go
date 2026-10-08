@@ -190,7 +190,7 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 		return true
 	}
 	if !u.LoggedIn() {
-		s.add(Fail, "san_vpn setup init (or devtunnel user login -g)", "not signed in to dev tunnels, so the tunnel cannot be hosted")
+		s.add(Fail, "san_vpn setup init (or devtunnel user login -g)", "not signed in to dev tunnels (%s), so the tunnel cannot be hosted", u.Status)
 		return false
 	}
 	s.add(OK, "", "signed in to dev tunnels as %s (%s)", u.Username, u.Provider)
