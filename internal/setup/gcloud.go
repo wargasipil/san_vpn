@@ -29,10 +29,13 @@ func FindGCloud() (*GCloud, error) {
 }
 
 func runGCloud(ctx context.Context, path string, args []string) ([]byte, []byte, error) {
+	cmd, err := gcloudCommand(ctx, path, args)
+	if err != nil {
+		return nil, nil, err
+	}
 	var out, errb bytes.Buffer
-	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdout, cmd.Stderr = &out, &errb
-	err := cmd.Run()
+	err = cmd.Run()
 	return out.Bytes(), errb.Bytes(), err
 }
 
