@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 
 	"github.com/urfave/cli/v3"
 
@@ -20,7 +19,7 @@ import (
 func setupCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "setup",
-		Usage: "put the relay behind a Microsoft dev tunnel or on Google Cloud Run, and check a machine's whole path",
+		Usage: "put the relay behind a Microsoft dev tunnel, and check a machine's whole path",
 		Commands: []*cli.Command{
 			{
 				Name:  "init",
@@ -34,18 +33,13 @@ func setupCommand() *cli.Command {
 				Action: runSetupInit,
 			},
 			{
-				Name:  "cloudrun",
-				Usage: "run the relay on Google Cloud Run, its file in Cloud Storage, using your gcloud sign-in (safe to rerun)",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "project", Usage: "Google Cloud project (default: gcloud's configured project)"},
-					&cli.StringFlag{Name: "region", Value: setup.DefaultRegion, Usage: "Cloud Run region"},
-					&cli.StringFlag{Name: "service", Value: setup.DefaultService, Usage: "Cloud Run service name"},
-					&cli.StringFlag{Name: "image", Usage: "container image to run (default: this release's image from ghcr.io, through Artifact Registry)"},
-					&cli.DurationFlag{Name: "timeout", Value: setup.DefaultRequestTimeout, Usage: "request timeout, and so how long a member connection lasts before it is renewed (1m to 1h)"},
-					&cli.BoolFlag{Name: "dry-run", Usage: "look at everything, change nothing, and print the gcloud commands it would run"},
+				// Where it was until v0.4.2, which took a prebuilt image.
+				Name:            "cloudrun",
+				Hidden:          true,
+				SkipFlagParsing: true,
+				Action: func(context.Context, *cli.Command) error {
+					return errors.New("`setup cloudrun` is now two commands: `san_vpn cloudrun setup` readies the project, then `san_vpn cloudrun deploy` builds the relay from source and runs it")
 				},
-				Description: "The relay's file goes in --state when that is a gs:// location, else in gs://<project>-san-vpn.",
-				Action:      runSetupCloudRun,
 			},
 			{
 				Name:   "check",
@@ -105,47 +99,6 @@ func runSetupInit(ctx context.Context, cmd *cli.Command) error {
 // cannot open: a VPS over SSH.
 func headless() bool {
 	return runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == ""
-}
-
-func runSetupCloudRun(ctx context.Context, cmd *cli.Command) error {
-	loc := cmd.String("state")
-	if loc != "" && !strings.HasPrefix(loc, "gs://") {
-		return fmt.Errorf("--state %s: a relay on Cloud Run keeps its file in Cloud Storage; pass a gs:// location, or none", loc)
-	}
-	g, err := setup.FindGCloud()
-	if err != nil {
-		return err
-	}
-	w := cmd.Root().Writer
-	dry := cmd.Bool("dry-run")
-	if dry {
-		fmt.Fprintln(w, "Dry run: looking only; the commands that would change something are listed")
-	} else {
-		fmt.Fprintln(w, "Running the relay on Google Cloud Run")
-	}
-	res, err := setup.InitCloudRun(ctx, g, setup.CloudRunOptions{
-		Project: cmd.String("project"),
-		Region:  cmd.String("region"),
-		Service: cmd.String("service"),
-		State:   loc,
-		Image:   cmd.String("image"),
-		Version: version,
-		Timeout: cmd.Duration("timeout"),
-		DryRun:  dry,
-		Out:     w,
-	})
-	if err != nil {
-		return err
-	}
-	if dry {
-		return nil
-	}
-	fmt.Fprintf(w, "\nThe relay runs at %s\n\n", res.URL)
-	fmt.Fprintln(w, "Next, from any machine signed in to gcloud:")
-	fmt.Fprintf(w, "  san_vpn --state %s relay invite <name>   one invite per machine, then on that machine: san_vpn join <invite>\n", res.State)
-	fmt.Fprintf(w, "  san_vpn --state %s setup check           confirms the relay, end to end\n", res.State)
-	fmt.Fprintln(w, "Set SAN_VPN_STATE to that location to leave out --state.")
-	return nil
 }
 
 func runSetupCheck(ctx context.Context, cmd *cli.Command) error {

@@ -42,7 +42,8 @@ type State struct {
 	// Tunnel is the dev tunnel `setup init` put in front of the relay, which
 	// `relay run` hosts. Nil when the relay is fronted some other way.
 	Tunnel *Tunnel `json:"tunnel,omitempty"`
-	// CloudRun is the Cloud Run service `setup cloudrun` runs the relay as.
+	// CloudRun is the Cloud Run service `cloudrun setup` readied and
+	// `cloudrun deploy` runs the relay as.
 	// Nil when the relay runs anywhere else.
 	CloudRun *CloudRun `json:"cloud_run,omitempty"`
 }

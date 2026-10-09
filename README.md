@@ -66,7 +66,9 @@ Releases are built by [`.github/workflows/release.yml`](.github/workflows/releas
 when a version tag is pushed. It runs `build.sh` with the tag as the version, so
 `san_vpn --version` prints the tag. It also publishes the relay's container
 image, built from the [`Dockerfile`](Dockerfile), as
-`ghcr.io/wargasipil/san_vpn:<tag>` for Cloud Run:
+`ghcr.io/wargasipil/san_vpn:<tag>`, for running the relay in Docker. Cloud Run
+does not use it: `cloudrun deploy` builds the same Dockerfile from the tag's
+source in your own project.
 
 ```sh
 git tag -a v0.2.0 -m "san_vpn v0.2.0"
@@ -214,30 +216,46 @@ Instead of behind a dev tunnel, the relay can run on Cloud Run. Then no
 machine of yours has to stay on for the network to work, and there is no dev
 tunnel usage limit. It costs money; see below.
 
-**1. Deploy it** from any machine with the
+**1. Set up and deploy it** from any machine with the
 [gcloud CLI](https://cloud.google.com/sdk/docs/install), signed in with
 `gcloud auth login`:
 
 ```powershell
-san_vpn setup cloudrun --dry-run    # look first: lists the gcloud commands it would run
-san_vpn setup cloudrun              # --project, --region (default asia-southeast2, Jakarta)
+san_vpn cloudrun setup --dry-run    # look first: lists the gcloud commands it would run
+san_vpn cloudrun setup              # --project, --region (default asia-southeast2, Jakarta)
+san_vpn cloudrun deploy             # builds the relay from source and runs it; takes a few minutes
 ```
 
-Like `setup init`, each step checks before it acts, so it is safe to rerun:
+`cloudrun setup` readies the project once. Like `setup init`, each step checks
+before it acts, so it is safe to rerun:
 
-- turns on the Cloud Run and Artifact Registry APIs if they are off
+- turns on the Cloud Run, Artifact Registry and Cloud Build APIs if they are
+  off
 - creates a private bucket, `gs://<project>-san-vpn`, for the relay's file
   (`--state gs://...` picks another)
 - creates a service account that may read and write that bucket, and nothing
   else
-- creates the relay's key in the bucket, with your own gcloud sign-in
-- creates an Artifact Registry repository that caches `ghcr.io`, where each
-  release publishes the relay's image (`--image` runs another, and a local
-  build needs it)
+- creates the relay's key in the bucket, with your own gcloud sign-in, and
+  records the project, region and service there for `cloudrun deploy`
+- creates an Artifact Registry repository, `san-vpn`, for the relay's images
+- lets Cloud Build's service account build, if it may not yet (projects made
+  since mid-2024 build as the Compute Engine default account, which may hold
+  no role)
+
+`cloudrun deploy` builds and runs the relay:
+
+- builds the image with Cloud Build, from the source of this release
+  (downloaded from GitHub), into the `san-vpn` repository. A release already
+  built there is not built again. `--source <dir>` builds a checkout of your
+  own instead, as does `go run` started in one; `--image` runs an image as it
+  is, with no build.
 - deploys the service `san-vpn-relay`: one instance at most, a one-hour request
   timeout, open to anyone. The relay itself admits only its members' keys.
 - records the service's URL as the relay's URL, and checks it, WebSocket
   included
+
+After `san_vpn update`, run `san_vpn cloudrun deploy` again to move the relay
+to the new release. Members reconnect on their own.
 
 **2. Invite each machine** from any machine signed in to gcloud. The admin
 commands read and write the bucket directly:
@@ -316,7 +334,8 @@ san_vpn up                                    # or, just this once: san_vpn up -
 | Command | Where | What |
 |---|---|---|
 | `setup init [--port P] [--tunnel ID] [--device-code] [--no-install]` | relay | Install devtunnel, sign in, and create the relay, its tunnel, anonymous access and port. Safe to rerun. |
-| `setup cloudrun [--project P] [--region R] [--service S] [--image I] [--timeout D] [--dry-run]` | any, with gcloud | Run the relay on Cloud Run, its file in Cloud Storage. Safe to rerun. |
+| `cloudrun setup [--project P] [--region R] [--service S] [--dry-run]` | any, with gcloud | Ready a project for the relay on Cloud Run, its file in Cloud Storage. Safe to rerun. |
+| `cloudrun deploy [--source DIR] [--image I] [--timeout D] [--dry-run]` | any, with gcloud | Build the relay from source with Cloud Build and run it. Again after `update`, to move it to the new release. |
 | `setup check [--json] [--profile P]` | any | Check the relay and its tunnel, and/or this member, end to end. |
 | `relay init [--url U] [--network N]` | relay | Create the relay key and network (default `10.77.0.0/24`). Run it again to change the URL; the key is kept. |
 | `relay run [--listen A] [--no-tunnel] [--session-limit D]` | relay | Serve the relay (default `127.0.0.1:8443`, or `:$PORT` when `PORT` is set), and host the dev tunnel that `setup init` made. With `--session-limit`, members renew their connections before a front cuts them. |

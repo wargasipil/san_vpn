@@ -3,8 +3,9 @@
 #   git tag -a v0.2.0 -m "san_vpn v0.2.0" && git push origin v0.2.0
 #
 # The binaries come from build.sh, the same script as a local build, stamped
-# with the tag as their version. The relay's container image, for Cloud Run,
-# goes to ghcr.io/<owner>/san_vpn:<tag> (and :latest). A tag with a "-"
+# with the tag as their version. The relay's container image, for Docker,
+# goes to ghcr.io/<owner>/san_vpn:<tag> (and :latest); Cloud Run builds its
+# own from the tag's source (`san_vpn cloudrun deploy`). A tag with a "-"
 # (v0.2.0-rc1) becomes a prerelease, and does not move :latest.
 name: release
 
@@ -74,7 +75,8 @@ jobs:
           - **Linux**: \`san_vpn-linux-amd64\`, then \`chmod +x\`.
           - **Raspberry Pi**: \`san_vpn-linux-arm64\` when \`uname -m\` says \`aarch64\`, \`san_vpn-linux-arm\` when it says \`armv6l\` or \`armv7l\`; then \`chmod +x\`.
           - Check downloads against \`SHA256SUMS\`.
-          - **Relay on Cloud Run**: image \`ghcr.io/${REPO,,}:$TAG\`, which \`san_vpn setup cloudrun\` deploys.
+          - **Relay on Cloud Run**: \`san_vpn cloudrun setup\`, then \`san_vpn cloudrun deploy\`, which builds this tag from source with Cloud Build.
+          - **Relay in Docker**: image \`ghcr.io/${REPO,,}:$TAG\`.
           EOF
           prerelease=()
           if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi

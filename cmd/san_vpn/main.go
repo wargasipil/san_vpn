@@ -70,7 +70,7 @@ func root(out io.Writer) *cli.Command {
 			}
 			return ctx, nil
 		},
-		Commands: []*cli.Command{setupCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand(), profileCommand(), updateCommand()},
+		Commands: []*cli.Command{setupCommand(), cloudrunCommand(), relayCommand(), joinCommand(), upCommand(), statusCommand(), profileCommand(), updateCommand()},
 	}
 }
 

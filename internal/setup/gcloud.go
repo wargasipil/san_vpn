@@ -11,8 +11,8 @@ import (
 )
 
 // GCloud drives Google's gcloud CLI, the way CLI drives devtunnel: it holds
-// the user's sign-in and knows every API, so `setup cloudrun` needs no Google
-// SDK and no credentials of its own.
+// the user's sign-in and knows every API, so the cloudrun commands need no
+// Google SDK and no credentials of their own.
 type GCloud struct {
 	Path string
 	// Run executes gcloud and captures its output. Tests replace it.
