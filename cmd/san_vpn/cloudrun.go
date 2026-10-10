@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/urfave/cli/v3"
 
 	"github.com/wargasipil/san_vpn/internal/setup"
+	"github.com/wargasipil/san_vpn/internal/state"
 	"github.com/wargasipil/san_vpn/internal/update"
 )
 
@@ -23,12 +25,13 @@ func cloudrunCommand() *cli.Command {
 			&cli.StringFlag{Name: "region", Usage: "Cloud Run region (default: the one setup recorded, else " + setup.DefaultRegion + ", Jakarta)"},
 			&cli.StringFlag{Name: "service", Usage: "Cloud Run service name (default: the one setup recorded, else " + setup.DefaultService + ")"},
 			&cli.BoolFlag{Name: "dry-run", Usage: "look at everything, change nothing, and print the gcloud commands it would run"},
+			&cli.StringFlag{Name: "relay", Sources: cli.EnvVars("SAN_VPN_RELAY"), Usage: "keep the relay under relay profile `name` (default: the current one when it is on Cloud Storage, else cloudrun)"},
 		}, more...)
 	}
 	return &cli.Command{
 		Name:        "cloudrun",
 		Usage:       "run the relay on Google Cloud Run, its file in Cloud Storage, using your gcloud sign-in",
-		Description: "The relay's file goes in --state when that is a gs:// location, else in gs://<project>-san-vpn.",
+		Description: "The relay's file goes in --state when that is a gs:// location, else where its relay profile says, else in gs://<project>-san-vpn. This machine keeps it as relay profile cloudrun unless --relay names another.",
 		Commands: []*cli.Command{
 			{
 				Name:   "setup",
@@ -50,11 +53,17 @@ func cloudrunCommand() *cli.Command {
 	}
 }
 
+// defaultCloudRunRelay is the relay profile a relay on Cloud Run is kept
+// under when none is named.
+const defaultCloudRunRelay = "cloudrun"
+
 // cloudRunOptions are what setup and deploy share: where, and how loudly.
-func cloudRunOptions(cmd *cli.Command) (setup.CloudRunOptions, error) {
-	loc := cmd.String("state")
-	if loc != "" && !strings.HasPrefix(loc, "gs://") {
-		return setup.CloudRunOptions{}, fmt.Errorf("--state %s: a relay on Cloud Run keeps its file in Cloud Storage; pass a gs:// location, or none", loc)
+// The relay pick says which relay profile keeps the relay once it is made;
+// its name is empty for a relay named only by --state.
+func cloudRunOptions(cmd *cli.Command) (setup.CloudRunOptions, relayPick, error) {
+	loc, p, err := cloudRunRelay(cmd)
+	if err != nil {
+		return setup.CloudRunOptions{}, relayPick{}, err
 	}
 	return setup.CloudRunOptions{
 		Project: cmd.String("project"),
@@ -63,11 +72,90 @@ func cloudRunOptions(cmd *cli.Command) (setup.CloudRunOptions, error) {
 		State:   loc,
 		DryRun:  cmd.Bool("dry-run"),
 		Out:     cmd.Root().Writer,
-	}, nil
+	}, p, nil
+}
+
+// cloudRunRelay picks the relay's file for a cloudrun command: --state, a
+// gs:// location; else the relay profile --relay names; else the current one
+// when it is on Cloud Storage; else cloudrun. loc is empty for a profile with
+// no relay yet, which setup puts in gs://<project>-san-vpn.
+func cloudRunRelay(cmd *cli.Command) (loc string, p relayPick, err error) {
+	loc, name := cmd.String("state"), cmd.String("relay")
+	if loc != "" && !state.RemoteLocation(loc) {
+		return "", p, fmt.Errorf("--state %s: a relay on Cloud Run keeps its file in Cloud Storage; pass a gs:// location, or none", loc)
+	}
+	if loc != "" && name == "" {
+		return loc, p, nil // named by its location alone, as before relay profiles
+	}
+	dir, err := state.RelayDir()
+	if err != nil {
+		return "", p, err
+	}
+	return cloudRunRelayIn(dir, loc, name)
+}
+
+// cloudRunRelayIn is cloudRunRelay with the relay directory dir, a gs://
+// --state loc or none, and --relay name or none.
+func cloudRunRelayIn(dir, loc, name string) (string, relayPick, error) {
+	p := relayPick{dir: dir}
+	if name == "" {
+		name = cloudRunDefault(dir)
+	}
+	have, known, err := state.RelayLocation(dir, name)
+	if err != nil {
+		return "", p, err
+	}
+	p.name, p.known = name, known
+	switch {
+	case known && !state.RemoteLocation(have):
+		return "", p, fmt.Errorf("relay profile %q is a relay on this machine, in %s; a relay on Cloud Run keeps its file in Cloud Storage, so name another with --relay", name, have)
+	case known && loc != "" && strings.TrimRight(loc, "/") != have:
+		return "", p, fmt.Errorf("relay profile %q is kept in %s, not %s", name, have, loc)
+	case known:
+		loc = have
+	}
+	p.loc = loc
+	return loc, p, nil
+}
+
+// cloudRunDefault is the relay profile a cloudrun command works on when none
+// is named: the current one when it is on Cloud Storage, else cloudrun.
+func cloudRunDefault(dir string) string {
+	if cur, err := state.CurrentRelay(dir); err == nil {
+		if loc, _, err := state.RelayLocation(dir, cur); err == nil && state.RemoteLocation(loc) {
+			return cur
+		}
+	}
+	return defaultCloudRunRelay
+}
+
+// keepCloudRunRelay records the relay setup or deploy worked on under its
+// relay profile.
+func keepCloudRunRelay(p relayPick, res *setup.CloudRunResult) (relayPick, error) {
+	if p.name == "" {
+		return p, nil
+	}
+	if err := rememberRelay(p.dir, p.name, res.State); err != nil {
+		return p, err
+	}
+	p.loc, p.known = res.State, true
+	return p, nil
+}
+
+// cloudRunArg is what the next cloudrun command needs to find the same relay:
+// nothing when it would anyway.
+func cloudRunArg(p relayPick, res *setup.CloudRunResult) string {
+	switch {
+	case p.name == "":
+		return " --state " + res.State
+	case p.name == cloudRunDefault(p.dir):
+		return ""
+	}
+	return " --relay " + p.name
 }
 
 func runCloudRunSetup(ctx context.Context, cmd *cli.Command) error {
-	o, err := cloudRunOptions(cmd)
+	o, p, err := cloudRunOptions(cmd)
 	if err != nil {
 		return err
 	}
@@ -85,13 +173,19 @@ func runCloudRunSetup(ctx context.Context, cmd *cli.Command) error {
 	if err != nil || o.DryRun {
 		return err
 	}
+	if p, err = keepCloudRunRelay(p, res); err != nil {
+		return err
+	}
+	if p.name != "" {
+		fmt.Fprintf(w, "  ok   relay profile %q on this machine\n", p.name)
+	}
 	fmt.Fprintln(w, "\nNext, build the relay from source and run it:")
-	fmt.Fprintf(w, "  san_vpn%s cloudrun deploy\n", stateArg(cmd, res))
+	fmt.Fprintf(w, "  san_vpn cloudrun deploy%s\n", cloudRunArg(p, res))
 	return nil
 }
 
 func runCloudRunDeploy(ctx context.Context, cmd *cli.Command) error {
-	o, err := cloudRunOptions(cmd)
+	o, p, err := cloudRunOptions(cmd)
 	if err != nil {
 		return err
 	}
@@ -118,22 +212,34 @@ func runCloudRunDeploy(ctx context.Context, cmd *cli.Command) error {
 	if err != nil || o.DryRun {
 		return err
 	}
+	if p, err = keepCloudRunRelay(p, res); err != nil {
+		return err
+	}
 	fmt.Fprintf(w, "\nThe relay runs at %s\n\n", res.URL)
-	fmt.Fprintln(w, "Next, from any machine signed in to gcloud:")
-	fmt.Fprintf(w, "  san_vpn --state %s relay invite <name>   one invite per machine, then on that machine: san_vpn join <invite>\n", res.State)
-	fmt.Fprintf(w, "  san_vpn --state %s setup check           confirms the relay, end to end\n", res.State)
-	fmt.Fprintln(w, "Set SAN_VPN_STATE to that location to leave out --state.")
-	fmt.Fprintf(w, "After `san_vpn update`, run `san_vpn%s cloudrun deploy` again to move the relay to the new release.\n", stateArg(cmd, res))
+	printCloudRunNext(w, p, res)
 	return nil
 }
 
-// stateArg is " --state <location>" when the relay's file is somewhere other
-// than the default, for the next command to print.
-func stateArg(cmd *cli.Command, res *setup.CloudRunResult) string {
-	if cmd.String("state") == "" {
-		return ""
+// printCloudRunNext says how to invite to the relay just deployed.
+func printCloudRunNext(w io.Writer, p relayPick, res *setup.CloudRunResult) {
+	if p.name == "" {
+		fmt.Fprintln(w, "Next, from any machine signed in to gcloud:")
+		fmt.Fprintf(w, "  san_vpn --state %s relay invite <name>   one invite per machine, then on that machine: san_vpn join <invite>\n", res.State)
+		fmt.Fprintf(w, "  san_vpn --state %s setup check           confirms the relay, end to end\n", res.State)
+		fmt.Fprintln(w, "Set SAN_VPN_STATE to that location to leave out --state.")
+	} else {
+		arg := relayArg(p)
+		fmt.Fprintf(w, "Next, on this machine, where it is relay profile %q:\n", p.name)
+		tw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+		fmt.Fprintf(tw, "  san_vpn relay invite%s <name>\tone invite per machine, then on that machine: san_vpn join <invite>\n", arg)
+		fmt.Fprintf(tw, "  san_vpn setup check%s\tconfirms the relay, end to end\n", arg)
+		_ = tw.Flush()
+		if arg != "" {
+			fmt.Fprintf(w, "or make it the one the relay commands use: san_vpn relay profile use %s\n", p.name)
+		}
+		fmt.Fprintf(w, "On another machine signed in to gcloud, name it first: san_vpn relay profile add %s %s\n", p.name, res.State)
 	}
-	return " --state " + res.State
+	fmt.Fprintf(w, "After `san_vpn update`, run `san_vpn cloudrun deploy%s` again to move the relay to the new release.\n", cloudRunArg(p, res))
 }
 
 func deploySource(cmd *cli.Command) (string, func(context.Context) (string, error), func(), error) {

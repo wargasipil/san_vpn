@@ -361,6 +361,12 @@ func TestCheck(t *testing.T) {
 	if !Failed(sections) || !strings.Contains(dump(sections), "tunnel is not hosted") || !strings.Contains(dump(sections), "san_vpn relay run") {
 		t.Fatalf("unhosted tunnel not reported:\n%s", dump(sections))
 	}
+	// One of several relays: the title and the fix name it.
+	withName := opts
+	withName.RelayName = "tunnel"
+	if sections = Check(ctx, withName);sections[0].Title != "relay, profile tunnel" || !strings.Contains(dump(sections), "san_vpn relay run --relay tunnel (it hosts the tunnel)") {
+		t.Fatalf("named relay check:\n%s", dump(sections))
+	}
 	f.tunnels["san-vpn-test01.asse"].hosts = 1
 
 	// A member: joined, but `up` not running.

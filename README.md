@@ -234,7 +234,9 @@ before it acts, so it is safe to rerun:
 - turns on the Cloud Run, Artifact Registry and Cloud Build APIs if they are
   off
 - creates a private bucket, `gs://<project>-san-vpn`, for the relay's file
-  (`--state gs://...` picks another)
+  (`--state gs://...` picks another), and names it relay profile `cloudrun`
+  on this machine (`--relay` picks another name; see
+  [Relay profiles](#look-after-several-relays-with-relay-profiles))
 - creates a service account that may read and write that bucket, and nothing
   else
 - creates the relay's key in the bucket, with your own gcloud sign-in, and
@@ -263,11 +265,17 @@ to the new release. Members reconnect on their own.
 commands read and write the bucket directly:
 
 ```powershell
-$env:SAN_VPN_STATE = "gs://<project>-san-vpn"
-san_vpn relay invite home
-san_vpn relay list
-san_vpn setup check
+san_vpn relay invite --relay cloudrun home
+san_vpn relay list --relay cloudrun
+san_vpn setup check --relay cloudrun
+san_vpn relay profile use cloudrun      # or make it the relay these commands use without --relay
 ```
+
+On another machine, name the relay first:
+`san_vpn relay profile add cloudrun gs://<project>-san-vpn`. A relay set up
+before relay profiles existed gets its name the same way, or by running
+`cloudrun setup` again. `--state gs://...` (env `SAN_VPN_STATE`) still names
+the bucket directly, as before.
 
 Joining and `up` work as with a dev tunnel. A machine that is already in the
 dev tunnel network keeps both with `san_vpn join --profile cloudrun ...`; see
@@ -327,9 +335,54 @@ san_vpn up                                    # or, just this once: san_vpn up -
 - A machine's first membership becomes the current profile, whatever it is
   called. A `node.json` from before profiles existed is the profile `default`,
   and stays where it is until you rename it.
-- Profiles are for members. The relay commands still pick their relay with
-  `--state`: the dev tunnel relay's file on the relay machine, the Cloud Run
-  relay's in `gs://<project>-san-vpn`.
+- Profiles are for members. The relay side has its own:
+  [relay profiles](#look-after-several-relays-with-relay-profiles).
+
+## Look after several relays with relay profiles
+
+A machine that looks after more than one relay, say the dev tunnel relay it
+serves and the one on Cloud Run, names each one. The relay commands then work
+on one of them at a time. An invite holds its relay's URL and key, so it joins
+that relay's network and no other. A relay command that picked the wrong relay
+would invite the machine into the wrong network.
+
+```powershell
+san_vpn cloudrun setup                       # the Cloud Run relay: relay profile "cloudrun"
+san_vpn relay profile rename default tunnel  # optional: name the dev tunnel relay after its front
+san_vpn relay invite home                    # the current relay: tunnel
+san_vpn relay invite --relay cloudrun home   # or, just this once, another one
+san_vpn relay profile use cloudrun           # from now on, the relay commands use cloudrun
+```
+
+```text
+> san_vpn relay profile list
+  RELAY     URL                                             MEMBERS  WHERE
+* cloudrun  https://san-vpn-relay-abc123-et.a.run.app       2        gs://my-project-san-vpn
+  tunnel    https://san-vpn-k3x9qa-8443.asse.devtunnels.ms  3        C:\Users\me\AppData\Roaming\san_vpn
+```
+
+- `--relay <name>` (env `SAN_VPN_RELAY`) works on `relay init`, `relay run`,
+  `relay invite`, `relay list`, `relay remove`, `setup init`, `setup check`,
+  `cloudrun setup` and `cloudrun deploy`. Without it they use the current
+  relay profile, the one `relay profile use` chose. The cloudrun commands use
+  the current one when it is in Cloud Storage, else `cloudrun`.
+- It is `--relay`, not `--profile`: a member profile and a relay profile are
+  different things, often with the same name, and `setup check` takes both.
+- **A relay profile is only a name for where the relay's file is.** That is a
+  folder on this machine, or a `gs://` location. `rename` and `forget` never
+  move or delete a file. A relay from before relay profiles is `default`, in
+  the folder it always used.
+- `relay init --relay <name>` or `setup init --relay <name>` makes a new relay
+  on this machine, in `relays/<name>/`. Two dev tunnel relays need different
+  ports (`setup init --port`). A machine's first relay becomes the current
+  one, whatever it is called.
+- `relay profile add <name> <location>` names a relay made elsewhere, such as
+  the Cloud Run relay on a second admin machine.
+- `relay run` serves only a relay on this machine's disk. A relay in a bucket
+  is served by Cloud Run, and a second copy here would split its members
+  between two relays.
+- `--state gs://...` still names one relay directly and takes no `--relay`.
+  `--state <dir>` moves the folder that holds the relays and `relays.json`.
 
 ## Names
 
@@ -377,15 +430,20 @@ it.
 
 | Command | Where | What |
 |---|---|---|
-| `setup init [--port P] [--tunnel ID] [--device-code] [--no-install]` | relay | Install devtunnel, sign in, and create the relay, its tunnel, anonymous access and port. Safe to rerun. |
-| `cloudrun setup [--project P] [--region R] [--service S] [--dry-run]` | any, with gcloud | Ready a project for the relay on Cloud Run, its file in Cloud Storage. Safe to rerun. |
-| `cloudrun deploy [--source DIR] [--image I] [--timeout D] [--dry-run]` | any, with gcloud | Build the relay from source with Cloud Build and run it. Again after `update`, to move it to the new release. |
-| `setup check [--json] [--profile P]` | any | Check the relay and its tunnel, and/or this member, end to end. |
-| `relay init [--url U] [--network N] [--domain D]` | relay | Create the relay key and network (default `10.77.0.0/24`, names under `vpn`). Run it again to change the URL or the domain; the key is kept. |
-| `relay run [--listen A] [--no-tunnel] [--session-limit D]` | relay | Serve the relay (default `127.0.0.1:8443`, or `:$PORT` when `PORT` is set), and host the dev tunnel that `setup init` made. With `--session-limit`, members renew their connections before a front cuts them. |
-| `relay invite <name> [--ttl D]` | relay | Print a one-time invite. Names are lowercase letters, digits and `-`. |
-| `relay list [--json]` | relay | List members and invites still waiting. |
-| `relay remove <name>` | relay | Remove a member or an invite. A running relay disconnects the member within seconds, and the other members drop it. |
+| `setup init [--port P] [--tunnel ID] [--device-code] [--no-install] [--relay R]` | relay | Install devtunnel, sign in, and create the relay, its tunnel, anonymous access and port. Safe to rerun. |
+| `cloudrun setup [--project P] [--region R] [--service S] [--dry-run] [--relay R]` | any, with gcloud | Ready a project for the relay on Cloud Run, its file in Cloud Storage, and name it relay profile `cloudrun` (or `R`). Safe to rerun. |
+| `cloudrun deploy [--source DIR] [--image I] [--timeout D] [--dry-run] [--relay R]` | any, with gcloud | Build the relay from source with Cloud Build and run it. Again after `update`, to move it to the new release. |
+| `setup check [--json] [--profile P] [--relay R]` | any | Check the relay and its tunnel, and/or this member, end to end. |
+| `relay init [--url U] [--network N] [--domain D] [--relay R]` | relay | Create the relay key and network (default `10.77.0.0/24`, names under `vpn`). Run it again to change the URL or the domain; the key is kept. A new `--relay` name makes another relay. |
+| `relay run [--listen A] [--no-tunnel] [--session-limit D] [--relay R]` | relay | Serve the relay (default `127.0.0.1:8443`, or `:$PORT` when `PORT` is set), and host the dev tunnel that `setup init` made. With `--session-limit`, members renew their connections before a front cuts them. |
+| `relay invite <name> [--ttl D] [--relay R]` | relay | Print a one-time invite, and the relay URL it is for. Names are lowercase letters, digits and `-`. |
+| `relay list [--json] [--relay R]` | relay | List members and invites still waiting. |
+| `relay remove <name> [--relay R]` | relay | Remove a member or an invite. A running relay disconnects the member within seconds, and the other members drop it. |
+| `relay profile list [--json]` | relay | The relays this machine looks after, their URLs and members, and the one the relay commands use. |
+| `relay profile use <name>` | relay | Make a relay profile the one the relay commands use without `--relay`. |
+| `relay profile add <name> <dir or gs://...>` | relay | Name a relay made elsewhere, such as the Cloud Run relay on another admin machine. |
+| `relay profile rename <old> <new>` | relay | Rename a relay profile, e.g. `default` to `tunnel`. No file moves. |
+| `relay profile forget <name>` | relay | Drop a relay profile's name. The relay itself stays as it is. |
 | `join <invite> [--url U] [--header "K: V"] [--force] [--profile P]` | member, admin | Generate this machine's key and join. The private key never leaves the machine. With `--profile`, keep it beside the networks this machine is already in. |
 | `up [--interface I] [--mtu M] [--no-firewall] [--no-dns] [--profile P]` | member, admin | Create the tunnel interface, answer the members' names, and stay connected, reconnecting by itself. |
 | `status [--json] [--profile P]` | member | This machine's connection and its peers. |
@@ -398,13 +456,15 @@ The admin commands (`invite`, `remove`) change the relay's file while
 `relay run` is running, and it picks up the change. There is no admin port.
 
 Global flags: `--state <dir>` (env `SAN_VPN_STATE`; for the relay commands
-also `gs://<bucket>[/<folder>]`) and `--log-level` (env `SAN_VPN_LOG_LEVEL`).
+also `gs://<bucket>[/<folder>]`, which names one relay directly) and
+`--log-level` (env `SAN_VPN_LOG_LEVEL`).
 
 ## Where things live
 
 | | Windows | Linux |
 |---|---|---|
 | Relay (`relay.json`) | `%AppData%\san_vpn` | `~/.config/san_vpn` |
+| Other relays (`relays/<name>/relay.json`), the relay profiles and the current one (`relays.json`) | in the relay's folder | the same |
 | Relay on Cloud Run | `gs://<project>-san-vpn/relay.json` | the same |
 | Member (`node.json`, `status.json`) | `C:\ProgramData\san_vpn`, SYSTEM and Administrators only | `/var/lib/san_vpn`, mode 0700 |
 | Other profiles (`profiles/<name>/node.json`), the current one (`profile.json`) | in the member's folder | the same |

@@ -68,6 +68,9 @@ func Failed(sections []Section) bool {
 type CheckOptions struct {
 	// Relay is where the relay's file would be; nil checks no relay.
 	Relay state.Store
+	// RelayName names the relay's profile in the title and the fixes; empty
+	// when the machine has only the default relay.
+	RelayName string
 	// NodeDir holds the member's node.json and status.json: the node
 	// directory, or one profile's folder in it.
 	NodeDir string
@@ -118,6 +121,9 @@ func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
 		return Section{}, false
 	}
 	s := Section{Title: "relay", Path: o.Relay.String()}
+	if o.RelayName != "" {
+		s.Title = "relay, profile " + o.RelayName
+	}
 	var st relay.State
 	if _, err := o.Relay.Read(ctx, &st); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -149,9 +155,9 @@ func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
 	local := fmt.Sprintf("http://127.0.0.1:%d", port)
 	if err := expectRelay(ctx, o.HTTPClient, local); err != nil {
 		if strings.Contains(err.Error(), "refused") {
-			s.add(Fail, "san_vpn relay run", "relay is not running: nothing listens on %s", local)
+			s.add(Fail, "san_vpn relay run"+relayFlag(o), "relay is not running: nothing listens on %s", local)
 		} else {
-			s.add(Fail, "san_vpn relay run", "relay is not answering on %s: %v", local, err)
+			s.add(Fail, "san_vpn relay run"+relayFlag(o), "relay is not answering on %s: %v", local, err)
 		}
 	} else {
 		s.add(OK, "", "relay answers on %s", local)
@@ -163,12 +169,12 @@ func checkRelay(ctx context.Context, o CheckOptions) (Section, bool) {
 // checkPublic checks the relay where members reach it: its public URL.
 func checkPublic(ctx context.Context, o CheckOptions, s Section, st *relay.State, hosted bool) (Section, bool) {
 	if st.URL == "" {
-		s.add(Fail, "san_vpn setup init (or relay init --url)", "relay has no public URL, so invites cannot be made")
+		s.add(Fail, "san_vpn setup init"+relayFlag(o)+" (or relay init"+relayFlag(o)+" --url)", "relay has no public URL, so invites cannot be made")
 		return s, true
 	}
 	fix := ""
 	if !hosted {
-		fix = "san_vpn relay run (it hosts the tunnel)"
+		fix = "san_vpn relay run" + relayFlag(o) + " (it hosts the tunnel)"
 	}
 	if err := expectRelay(ctx, o.HTTPClient, st.URL); err != nil {
 		s.add(Fail, fix, "relay is not reachable at %s: %v", st.URL, err)
@@ -190,7 +196,7 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 	}
 	cli, err := o.FindCLI()
 	if err != nil {
-		s.add(Fail, "san_vpn setup init", "devtunnel CLI: %v", err)
+		s.add(Fail, "san_vpn setup init"+relayFlag(o), "devtunnel CLI: %v", err)
 		return true
 	}
 	if v, err := cli.Version(ctx); err == nil {
@@ -202,7 +208,7 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 		return true
 	}
 	if !u.LoggedIn() {
-		s.add(Fail, "san_vpn setup init (or devtunnel user login -g)", "not signed in to dev tunnels (%s), so the tunnel cannot be hosted", u.Status)
+		s.add(Fail, "san_vpn setup init"+relayFlag(o)+" (or devtunnel user login -g)", "not signed in to dev tunnels (%s), so the tunnel cannot be hosted", u.Status)
 		return false
 	}
 	s.add(OK, "", "signed in to dev tunnels as %s (%s)", u.Username, u.Provider)
@@ -210,7 +216,7 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 	id := st.Tunnel.ID
 	t, err := cli.Show(ctx, id)
 	if errors.Is(err, devtunnel.ErrNotFound) {
-		s.add(Fail, "san_vpn setup init", "tunnel %s no longer exists (unused tunnels expire after 30 days)", id)
+		s.add(Fail, "san_vpn setup init"+relayFlag(o), "tunnel %s no longer exists (unused tunnels expire after 30 days)", id)
 		return false
 	}
 	if err != nil {
@@ -222,25 +228,34 @@ func checkTunnel(ctx context.Context, o CheckOptions, s *Section, st *relay.Stat
 	if anon, err := cli.AllowsAnonymous(ctx, id); err != nil {
 		s.add(Fail, "", "devtunnel access list %s: %v", id, err)
 	} else if !anon {
-		s.add(Fail, "san_vpn setup init", "tunnel does not allow anonymous clients, so members are turned away by the tunnel")
+		s.add(Fail, "san_vpn setup init"+relayFlag(o), "tunnel does not allow anonymous clients, so members are turned away by the tunnel")
 	} else {
 		s.add(OK, "", "anonymous access")
 	}
 
 	if _, ok := t.Port(st.Tunnel.Port); !ok {
-		s.add(Fail, "san_vpn setup init", "tunnel has no port %d", st.Tunnel.Port)
+		s.add(Fail, "san_vpn setup init"+relayFlag(o), "tunnel has no port %d", st.Tunnel.Port)
 	} else if url, err := PortURL(t, st.Tunnel.Port); err == nil && url != st.URL {
-		s.add(Fail, "san_vpn setup init", "the relay's URL is %s but the tunnel's is %s", st.URL, url)
+		s.add(Fail, "san_vpn setup init"+relayFlag(o), "the relay's URL is %s but the tunnel's is %s", st.URL, url)
 	} else {
 		s.add(OK, "", "port %d forwarded", st.Tunnel.Port)
 	}
 
 	if t.HostConnections == 0 {
-		s.add(Fail, "san_vpn relay run (it hosts the tunnel)", "tunnel is not hosted")
+		s.add(Fail, "san_vpn relay run"+relayFlag(o)+" (it hosts the tunnel)", "tunnel is not hosted")
 		return false
 	}
 	s.add(OK, "", "tunnel is hosted")
 	return true
+}
+
+// relayFlag is how the fixes name the relay: " --relay <name>" once there is
+// more than one.
+func relayFlag(o CheckOptions) string {
+	if o.RelayName == "" {
+		return ""
+	}
+	return " --relay " + o.RelayName
 }
 
 func checkMember(ctx context.Context, o CheckOptions) (Section, bool) {

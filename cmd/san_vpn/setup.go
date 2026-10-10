@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"text/tabwriter"
 
 	"github.com/urfave/cli/v3"
 
@@ -29,6 +30,7 @@ func setupCommand() *cli.Command {
 					&cli.StringFlag{Name: "tunnel", Usage: "use this existing dev tunnel instead of creating one"},
 					&cli.BoolFlag{Name: "device-code", Usage: "sign in with a code entered on another device (automatic on Linux without a display)"},
 					&cli.BoolFlag{Name: "no-install", Usage: "do not install the devtunnel CLI when it is missing"},
+					relayFlag(),
 				},
 				Action: runSetupInit,
 			},
@@ -44,7 +46,7 @@ func setupCommand() *cli.Command {
 			{
 				Name:   "check",
 				Usage:  "check this machine: the relay and its tunnel, and/or this member's connection",
-				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}, profileFlag()},
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}, profileFlag(), relayFlag()},
 				Action: runSetupCheck,
 			},
 		},
@@ -52,10 +54,16 @@ func setupCommand() *cli.Command {
 }
 
 func runSetupInit(ctx context.Context, cmd *cli.Command) error {
-	path, err := relayPath(cmd, "setup init (a dev tunnel in front of this machine)")
+	// A new name makes a new relay, in a folder of its own.
+	p, err := pickRelay(cmd)
 	if err != nil {
 		return err
 	}
+	f, ok := p.store.(state.File)
+	if !ok {
+		return fmt.Errorf("setup init (a dev tunnel in front of this machine) works on a relay on this machine, not one kept in %s", p.store)
+	}
+	path := string(f)
 	w := cmd.Root().Writer
 	fmt.Fprintln(w, "Setting up the relay behind a Microsoft dev tunnel")
 
@@ -86,12 +94,25 @@ func runSetupInit(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	if !p.known {
+		if err := rememberRelay(p.dir, p.name, p.loc); err != nil {
+			return err
+		}
+	}
 
+	arg := relayArg(p)
 	fmt.Fprintf(w, "\nThe relay will be reachable at %s\n\n", res.URL)
 	fmt.Fprintln(w, "Next, on this machine:")
-	fmt.Fprintf(w, "  san_vpn relay run              serves the relay on 127.0.0.1:%d and hosts the tunnel; keep it running\n", res.Port)
-	fmt.Fprintln(w, "  san_vpn relay invite <name>    one invite per machine, then on that machine: san_vpn join <invite>")
-	fmt.Fprintln(w, "  san_vpn setup check            confirms everything, end to end")
+	tw := tabwriter.NewWriter(w, 0, 4, 4, ' ', 0)
+	fmt.Fprintf(tw, "  san_vpn relay run%s\tserves the relay on 127.0.0.1:%d and hosts the tunnel; keep it running\n", arg, res.Port)
+	fmt.Fprintf(tw, "  san_vpn relay invite%s <name>\tone invite per machine, then on that machine: san_vpn join <invite>\n", arg)
+	fmt.Fprintf(tw, "  san_vpn setup check%s\tconfirms everything, end to end\n", arg)
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if arg != "" {
+		fmt.Fprintf(w, "or make it the one the relay commands use: san_vpn relay profile use %s\n", p.name)
+	}
 	return nil
 }
 
@@ -102,7 +123,7 @@ func headless() bool {
 }
 
 func runSetupCheck(ctx context.Context, cmd *cli.Command) error {
-	store, err := relayStore(cmd)
+	rp, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
@@ -131,9 +152,10 @@ func runSetupCheck(ctx context.Context, cmd *cli.Command) error {
 		shown = profile
 	}
 	sections := setup.Check(ctx, setup.CheckOptions{
-		Relay:   store,
-		NodeDir: state.ProfileDir(dir, profile),
-		Profile: shown,
+		Relay:     rp.store,
+		RelayName: relayLabel(rp),
+		NodeDir:   state.ProfileDir(dir, profile),
+		Profile:   shown,
 		FindCLI: func() (*devtunnel.CLI, error) {
 			p, err := devtunnel.Find()
 			if err != nil {

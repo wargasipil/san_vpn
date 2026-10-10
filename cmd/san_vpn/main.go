@@ -89,6 +89,7 @@ func relayCommand() *cli.Command {
 					&cli.StringFlag{Name: "url", Usage: "the URL members dial, e.g. https://<id>-8443.asse.devtunnels.ms"},
 					&cli.StringFlag{Name: "network", Value: relay.DefaultNetwork.String(), Usage: "overlay address range"},
 					&cli.StringFlag{Name: "domain", Value: wire.DefaultDomain, Usage: "what the members' names end in: office.vpn"},
+					relayFlag(),
 				},
 				Action: runRelayInit,
 			},
@@ -99,6 +100,7 @@ func relayCommand() *cli.Command {
 					&cli.StringFlag{Name: "listen", Value: "127.0.0.1:8443", Usage: "address to listen on; put TLS (a dev tunnel, Caddy) in front. Default: the dev tunnel's port when setup init made one, else :$PORT when PORT is set (Cloud Run)"},
 					&cli.BoolFlag{Name: "no-tunnel", Usage: "do not host the dev tunnel from setup init (host it yourself, or front the relay another way)"},
 					&cli.DurationFlag{Name: "session-limit", Sources: cli.EnvVars("SAN_VPN_SESSION_LIMIT"), Usage: "end each member connection after this long, and have members renew it first; set it to Cloud Run's request timeout (0: no limit)"},
+					relayFlag(),
 				},
 				Action: runRelay,
 			},
@@ -108,61 +110,35 @@ func relayCommand() *cli.Command {
 				ArgsUsage: "<name>",
 				Flags: []cli.Flag{
 					&cli.DurationFlag{Name: "ttl", Value: relay.DefaultInviteTTL, Usage: "how long the invite stays usable"},
+					relayFlag(),
 				},
 				Action: runRelayInvite,
 			},
 			{
 				Name:   "list",
 				Usage:  "list members and waiting invites",
-				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}},
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json", Usage: "print JSON"}, relayFlag()},
 				Action: runRelayList,
 			},
 			{
 				Name:      "remove",
 				Usage:     "remove a member or a waiting invite",
 				ArgsUsage: "<name>",
+				Flags:     []cli.Flag{relayFlag()},
 				Action:    runRelayRemove,
 			},
+			relayProfileCommand(),
 		},
 	}
 }
 
-// relayStore is where the relay's file lives: --state, a local directory or
-// a gs:// bucket, else the user config dir.
-func relayStore(cmd *cli.Command) (state.Store, error) {
-	dir := cmd.String("state")
-	if dir == "" {
-		var err error
-		if dir, err = state.RelayDir(); err != nil {
-			return nil, err
-		}
-	}
-	return state.Open(dir, state.RelayFile)
-}
-
-// relayPath is the relay's file for commands that only work on local disk.
-func relayPath(cmd *cli.Command, what string) (string, error) {
-	store, err := relayStore(cmd)
-	if err != nil {
-		return "", err
-	}
-	f, ok := store.(state.File)
-	if !ok {
-		return "", fmt.Errorf("%s works on a relay on this machine, not one kept in %s", what, store)
-	}
-	return string(f), nil
-}
-
-// errNoRelay is a relay store that `relay init` never filled.
-func errNoRelay(store state.Store) error {
-	return fmt.Errorf("no relay at %s; run `san_vpn relay init` first", store)
-}
-
 func runRelayInit(ctx context.Context, cmd *cli.Command) error {
-	store, err := relayStore(cmd)
+	// A new name makes a new relay, in a folder of its own.
+	p, err := pickRelay(cmd)
 	if err != nil {
 		return err
 	}
+	store := p.store
 	network, err := netip.ParsePrefix(cmd.String("network"))
 	if err != nil {
 		return fmt.Errorf("--network: %w", err)
@@ -211,28 +187,47 @@ func runRelayInit(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	if !p.known {
+		if err := rememberRelay(p.dir, p.name, p.loc); err != nil {
+			return err
+		}
+	}
 
 	w := cmd.Root().Writer
+	verb := "updated"
 	if created {
-		fmt.Fprintf(w, "created relay %s\n", store)
+		verb = "created"
+	}
+	if label := relayLabel(p); label != "" {
+		fmt.Fprintf(w, "%s relay %q in %s\n", verb, label, store)
 	} else {
-		fmt.Fprintf(w, "updated relay %s\n", store)
+		fmt.Fprintf(w, "%s relay %s\n", verb, store)
 	}
 	fmt.Fprintf(w, "  key      %s\n  network  %s\n  domain   %s\n  url      %s\n", st.PrivateKey.Public(), st.Network, st.DomainOrDefault(), orNone(st.URL))
 	if d := st.DomainOrDefault(); d == "local" || strings.HasSuffix(d, ".local") {
 		fmt.Fprintln(w, "\nNote: .local belongs to multicast DNS. Linux machines with nss-mdns never ask a DNS server about it,\nand Windows may send printer.local and other LAN names to san_vpn while up runs.")
 	}
 	if st.URL == "" {
-		fmt.Fprintln(w, "\nInvites need the URL members will dial. Set it with: san_vpn relay init --url <https://...>")
+		fmt.Fprintf(w, "\nInvites need the URL members will dial. Set it with: san_vpn relay init%s --url <https://...>\n", relayArg(p))
+	}
+	if arg := relayArg(p); arg != "" && created {
+		fmt.Fprintf(w, "\nThe relay commands reach it with%s, or make it the one they use: san_vpn relay profile use %s\n", arg, p.name)
 	}
 	return nil
 }
 
 func runRelay(ctx context.Context, cmd *cli.Command) error {
-	store, err := relayStore(cmd)
+	p, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
+	// A relay profile in a bucket is served from there, by Cloud Run. Serving
+	// it here too would split its members between two relays; only an
+	// explicit --state, which Cloud Run passes, serves one.
+	if p.name != "" && state.RemoteLocation(p.loc) {
+		return fmt.Errorf("relay %q is kept in %s and served from there (san_vpn cloudrun deploy); relay run serves a relay of this machine: %s", p.name, p.loc, localRelayHint(p.dir))
+	}
+	store := p.store
 	log := slog.Default()
 	srv, err := relay.New(ctx, store, log)
 	if err != nil {
@@ -277,7 +272,7 @@ func runRelay(ctx context.Context, cmd *cli.Command) error {
 
 	log.Info("relay listening", "addr", ln.Addr().String(), "url", orNone(st.URL), "key", srv.PublicKey(), "state", store.String(), "session_limit", limit)
 	if st.URL == "" {
-		log.Warn("no public URL set, so invites cannot be made yet; run `san_vpn setup init` (dev tunnel) or `san_vpn relay init --url ...`")
+		log.Warn("no public URL set, so invites cannot be made yet; run `san_vpn setup init" + relayArg(p) + "` (dev tunnel) or `san_vpn relay init" + relayArg(p) + " --url ...`")
 	}
 	if st.Tunnel != nil && !cmd.Bool("no-tunnel") {
 		hostTunnel(ctx, st.Tunnel, log)
@@ -305,19 +300,19 @@ func runRelayInvite(ctx context.Context, cmd *cli.Command) error {
 	if name == "" || cmd.Args().Len() > 1 {
 		return errors.New("usage: san_vpn relay invite <name>")
 	}
-	store, err := relayStore(cmd)
+	p, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 
 	var st relay.State
 	var inv relay.Invite
-	err = store.Update(ctx, &st, func() error {
+	err = p.store.Update(ctx, &st, func() error {
 		if st.PrivateKey.IsZero() {
-			return errNoRelay(store)
+			return errNoRelay(p)
 		}
 		if st.URL == "" {
-			return errors.New("the relay has no public URL; set it with `san_vpn relay init --url <https://...>`")
+			return fmt.Errorf("the relay has no public URL; set it with `san_vpn relay init%s --url <https://...>`", relayArg(p))
 		}
 		var err error
 		inv, err = st.NewInvite(name, cmd.Duration("ttl"), time.Now())
@@ -332,7 +327,12 @@ func runRelayInvite(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	w := cmd.Root().Writer
-	fmt.Fprintf(w, "Invite for %q, usable once until %s:\n\n%s\n\n", name, inv.Expires.Local().Format("2006-01-02 15:04"), blob)
+	// Say which relay: an invite pins one relay, and so one network.
+	to := "the relay"
+	if label := relayLabel(p); label != "" {
+		to = fmt.Sprintf("relay %q", label)
+	}
+	fmt.Fprintf(w, "Invite for %q to %s at %s, usable once until %s:\n\n%s\n\n", name, to, st.URL, inv.Expires.Local().Format("2006-01-02 15:04"), blob)
 	fmt.Fprintln(w, "On the new machine, from an administrator terminal (sudo on Linux):")
 	fmt.Fprintln(w, "  san_vpn join <invite>")
 	fmt.Fprintln(w, "  san_vpn up")
@@ -341,14 +341,14 @@ func runRelayInvite(ctx context.Context, cmd *cli.Command) error {
 }
 
 func runRelayList(ctx context.Context, cmd *cli.Command) error {
-	store, err := relayStore(cmd)
+	p, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 	var st relay.State
-	if _, err := store.Read(ctx, &st); err != nil {
+	if _, err := p.store.Read(ctx, &st); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return errNoRelay(store)
+			return errNoRelay(p)
 		}
 		return err
 	}
@@ -365,12 +365,13 @@ func runRelayList(ctx context.Context, cmd *cli.Command) error {
 			Expires time.Time `json:"expires"`
 		}
 		out := struct {
+			Relay   string       `json:"relay,omitempty"`
 			Network netip.Prefix `json:"network"`
 			Domain  string       `json:"domain"`
 			URL     string       `json:"url"`
 			Nodes   []member     `json:"nodes"`
 			Invites []pending    `json:"invites"`
-		}{Network: st.Network, Domain: st.DomainOrDefault(), URL: st.URL, Nodes: []member{}, Invites: []pending{}}
+		}{Relay: p.name, Network: st.Network, Domain: st.DomainOrDefault(), URL: st.URL, Nodes: []member{}, Invites: []pending{}}
 		for _, n := range st.Nodes {
 			out.Nodes = append(out.Nodes, member{n.Name, n.IP, n.PublicKey.String(), n.Joined})
 		}
@@ -384,6 +385,9 @@ func runRelayList(ctx context.Context, cmd *cli.Command) error {
 		return enc.Encode(out)
 	}
 
+	if label := relayLabel(p); label != "" {
+		fmt.Fprintf(w, "relay %s  ", label)
+	}
 	fmt.Fprintf(w, "network %s  domain %s  url %s\n\n", st.Network, st.DomainOrDefault(), orNone(st.URL))
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tIP\tJOINED\tKEY")
@@ -403,15 +407,15 @@ func runRelayRemove(ctx context.Context, cmd *cli.Command) error {
 	if name == "" || cmd.Args().Len() > 1 {
 		return errors.New("usage: san_vpn relay remove <name>")
 	}
-	store, err := relayStore(cmd)
+	p, err := relayStore(cmd)
 	if err != nil {
 		return err
 	}
 	var st relay.State
 	var what string
-	if err := store.Update(ctx, &st, func() error {
+	if err := p.store.Update(ctx, &st, func() error {
 		if st.PrivateKey.IsZero() {
-			return errNoRelay(store)
+			return errNoRelay(p)
 		}
 		var err error
 		what, err = st.Remove(name)
@@ -419,7 +423,11 @@ func runRelayRemove(ctx context.Context, cmd *cli.Command) error {
 	}); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.Root().Writer, "removed %s %q; a running relay disconnects it within seconds\n", what, name)
+	from := ""
+	if label := relayLabel(p); label != "" {
+		from = fmt.Sprintf(" from relay %q", label)
+	}
+	fmt.Fprintf(cmd.Root().Writer, "removed %s %q%s; a running relay disconnects it within seconds\n", what, name, from)
 	return nil
 }
 
