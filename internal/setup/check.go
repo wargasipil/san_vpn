@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -75,6 +79,9 @@ type CheckOptions struct {
 	HTTPClient *http.Client
 	// StaleAfter is how old status.json may be before `up` counts as stopped.
 	StaleAfter time.Duration
+	// LookupIP resolves a name the way programs on this machine do. Nil
+	// means the system resolver.
+	LookupIP func(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
 // Check examines whatever is set up on this machine: the relay, a member, or
@@ -85,6 +92,11 @@ func Check(ctx context.Context, o CheckOptions) []Section {
 	}
 	if o.StaleAfter == 0 {
 		o.StaleAfter = 10 * time.Second
+	}
+	if o.LookupIP == nil {
+		o.LookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+		}
 	}
 	var out []Section
 	if s, ok := checkRelay(ctx, o); ok {
@@ -282,8 +294,36 @@ func checkMember(ctx context.Context, o CheckOptions) (Section, bool) {
 			}
 		}
 		s.add(OK, "", "san_vpn up is connected, %d of %d peer(s) online", online, len(st.Peers))
+		if st.DNS.IsValid() {
+			checkNames(ctx, o, &s, st)
+		}
 	}
 	return s, true
+}
+
+// checkNames resolves this machine's own name the way any program here would,
+// which proves the whole path: the operating system sends the domain to the
+// node, and the node answers.
+func checkNames(ctx context.Context, o CheckOptions, s *Section, st node.Status) {
+	host := st.Name + "." + st.Domain
+	fix := "restart san_vpn up as administrator and look for \"names\" in its log; Get-DnsClientNrptRule should list ." + st.Domain + " -> " + st.DNS.String()
+	if runtime.GOOS == "linux" {
+		fix = "restart san_vpn up as root and look for \"names\" in its log; see resolvectl status, or the san_vpn block in /etc/hosts"
+	}
+	lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ips, err := o.LookupIP(lctx, host)
+	cancel()
+	for i := range ips {
+		ips[i] = ips[i].Unmap() // Go's resolver gives ::ffff:10.77.0.2 for a hosts file entry
+	}
+	switch {
+	case err != nil:
+		s.add(Fail, fix, "%s does not resolve: %v", host, err)
+	case !slices.Contains(ips, st.IP):
+		s.add(Fail, fix, "%s resolves to %v, not to this machine's %s", host, ips, st.IP)
+	default:
+		s.add(OK, "", "%s resolves to %s (names answered at %s)", host, st.IP, st.DNS)
+	}
 }
 
 // expectRelay checks that base answers as a san_vpn relay, rather than as a

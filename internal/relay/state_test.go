@@ -209,3 +209,23 @@ func TestInitRejectsOddNetworks(t *testing.T) {
 		}
 	}
 }
+
+// The network's DNS address is every member's, so it is never given to one.
+func TestJoinSkipsTheDNSAddress(t *testing.T) {
+	s := newState(t, "10.77.0.0/29") // hosts .1 to .6; .6 is the DNS address
+	for i := range 6 {
+		name := string(rune('a' + i))
+		inv, err := s.NewInvite(name, time.Hour, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, _ := joinRequest(t, inv)
+		n, err := s.Join(req, now)
+		if i < 5 && (err != nil || n.IP != netip.AddrFrom4([4]byte{10, 77, 0, byte(i + 1)})) {
+			t.Fatalf("join %d: %+v, %v", i, n, err)
+		}
+		if i == 5 && !errors.Is(err, ErrNetworkFull) {
+			t.Fatalf("sixth join got %+v, %v; want the network full, .6 kept for DNS", n, err)
+		}
+	}
+}

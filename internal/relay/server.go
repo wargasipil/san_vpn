@@ -45,6 +45,7 @@ type Server struct {
 	mu       sync.RWMutex
 	priv     wire.Key
 	network  netip.Prefix
+	domain   string
 	members  map[wire.Key]Node
 	sessions map[wire.Key]*session
 	version  string
@@ -118,6 +119,7 @@ func (s *Server) Reload(ctx context.Context) error {
 	s.mu.Lock()
 	s.priv = st.PrivateKey
 	s.network = st.Network
+	s.domain = st.DomainOrDefault()
 	s.members = members
 	s.version = version
 	for k, sess := range s.sessions {
@@ -507,7 +509,7 @@ func (s *Server) writeLoop(ctx context.Context, cancel context.CancelFunc, c *we
 func (s *Server) netmapFor(key wire.Key) *wire.Netmap {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	nm := &wire.Netmap{Network: s.network, Peers: []wire.Peer{}}
+	nm := &wire.Netmap{Network: s.network, Domain: s.domain, Peers: []wire.Peer{}}
 	for k, n := range s.members {
 		p := wire.Peer{Name: n.Name, PublicKey: k, IP: n.IP}
 		if sess := s.sessions[k]; sess != nil {

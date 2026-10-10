@@ -9,6 +9,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/wargasipil/san_vpn/internal/names"
 	"github.com/wargasipil/san_vpn/internal/wire"
 )
 
@@ -24,3 +25,7 @@ func Create(string, int, wire.Key) (tun.Device, error) { return nil, errUnsuppor
 func Configure(tun.Device, netip.Prefix, int) error { return errUnsupported }
 
 func AllowInbound(netip.Prefix, netip.Addr) error { return nil }
+
+func (n *Names) Set(*names.Table) (string, error) { return "", errUnsupported }
+
+func (n *Names) Clear() error { return nil }

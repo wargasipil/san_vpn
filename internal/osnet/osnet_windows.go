@@ -16,6 +16,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
+	"github.com/wargasipil/san_vpn/internal/names"
 	"github.com/wargasipil/san_vpn/internal/wire"
 )
 
@@ -134,6 +135,65 @@ func cleanupStaleAddress(family winipcfg.AddressFamily, addr netip.Addr) {
 			}
 		}
 	}
+}
+
+// nrptComment marks the name resolution policy rules san_vpn owns.
+const nrptComment = "san_vpn"
+
+// removeNRPT drops every rule san_vpn added, including one a crashed `up` left.
+const removeNRPT = `Get-DnsClientNrptRule | Where-Object { $_.Comment -eq '` + nrptComment + `' } | ForEach-Object { Remove-DnsClientNrptRule -Name $_.Name -Force }`
+
+// Set sends this machine's lookups under t.Domain to t.Server, with a rule
+// in the Name Resolution Policy Table. It says how when it changed anything.
+//
+// The rule is per domain, so every other name still goes to the DNS servers
+// Windows had. Setting a DNS server on the adapter instead would not do:
+// Windows may ask any adapter's servers, and take whichever answers first.
+func (n *Names) Set(t *names.Table) (string, error) {
+	if t == nil || !t.Server.IsValid() {
+		return "", n.Clear()
+	}
+	want := t.Domain + " " + t.Server.String()
+	if n.applied == want {
+		return "", nil
+	}
+	// Recorded before trying, so that a rule that cannot be added is not
+	// retried on every change of members; the error is logged once.
+	n.applied = want
+	script := removeNRPT + "\n" +
+		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.%s' -NameServers '%s' -Comment '%s'\n", t.Domain, t.Server, nrptComment) +
+		"Clear-DnsClientCache"
+	if err := powershell(script); err != nil {
+		return "", fmt.Errorf("add a name resolution policy rule for .%s: %w", t.Domain, err)
+	}
+	return "a name resolution policy rule (Get-DnsClientNrptRule)", nil
+}
+
+// Clear removes the rule.
+func (n *Names) Clear() error {
+	if n.applied == "" {
+		return nil
+	}
+	n.applied = ""
+	if err := powershell(removeNRPT); err != nil {
+		return fmt.Errorf("remove the name resolution policy rule: %w", err)
+	}
+	return nil
+}
+
+// powershell runs script with Windows PowerShell, which every Windows since
+// 8 has with the DnsClient module, by full path: `up` runs as administrator,
+// and the PATH need not be trusted.
+func powershell(script string) error {
+	exe := filepath.Join(os.Getenv("SystemRoot"), `System32\WindowsPowerShell\v1.0\powershell.exe`)
+	if _, err := os.Stat(exe); err != nil {
+		exe = "powershell.exe"
+	}
+	out, err := exec.Command(exe, "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'\n"+script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // AllowInbound lets the other members reach this machine.

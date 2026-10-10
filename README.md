@@ -1,9 +1,9 @@
 # san_vpn
 
 `san_vpn` joins machines at home, at the office and in other regions into one
-private network. Every machine gets an address such as `10.77.0.2`, and every
-machine can reach every other one on that address: ping, SSH, RDP, a database
-port.
+private network. Every machine gets an address such as `10.77.0.2` and a name
+such as `home.vpn`, and every machine can reach every other one by either:
+ping, SSH, RDP, a database port.
 
 All traffic is WireGuard, end to end between the two machines. WireGuard
 normally runs over UDP. Here it is carried over a WebSocket to a relay. Because
@@ -187,6 +187,7 @@ member  (C:\ProgramData\san_vpn\node.json)
   ok   office at 10.77.0.1/24, via http://127.0.0.1:8443
   ok   relay accepts this machine's key
   ok   san_vpn up is connected, 2 of 2 peer(s) online
+  ok   office.vpn resolves to 10.77.0.1 (names answered at 10.77.0.254)
 ```
 
 `setup check` runs on any machine. It checks the relay part if this machine
@@ -198,12 +199,13 @@ short connection with this machine's key, so a running `up` stays connected.
 ```text
 > san_vpn status
 home  10.77.0.2/24  connected to https://abc123-8443.asse.devtunnels.ms for 3m
+names home.vpn and the others below, answered at 10.77.0.254
 
-NAME         IP         RELAY   HANDSHAKE  RX        TX
-office       10.77.0.1  online  12s ago    20.2 MiB  317.5 KiB
-jakarta-vps  10.77.0.3  online  1m ago     1.1 MiB   880.0 KiB
+NAME             IP         RELAY   HANDSHAKE  RX        TX
+office.vpn       10.77.0.1  online  12s ago    20.2 MiB  317.5 KiB
+jakarta-vps.vpn  10.77.0.3  online  1m ago     1.1 MiB   880.0 KiB
 
-> ping 10.77.0.1
+> ping office.vpn
 ```
 
 The `RELAY` column is the relay's view: does it have a connection from that
@@ -329,6 +331,48 @@ san_vpn up                                    # or, just this once: san_vpn up -
   `--state`: the dev tunnel relay's file on the relay machine, the Cloud Run
   relay's in `gs://<project>-san-vpn`.
 
+## Names
+
+Every member is also reachable by name: its member name plus the network's
+domain, `vpn` unless the relay sets another. `ssh office.vpn`,
+`mstsc /v:home.vpn`, `http://jakarta-vps.vpn:8080`.
+
+There is no name server to run. Each member answers for the names itself, from
+the member list the relay already sends it:
+
+- The network's last address, `10.77.0.254` in `10.77.0.0/24`, is kept for
+  names, and the relay gives it to no member. `up` answers DNS queries to it
+  inside the tunnel. Nothing listens on port 53, so it cannot clash with a DNS
+  server the machine already runs, such as Pi-hole or dnsmasq.
+- `up` points the domain, and only the domain, at that address:
+  - Windows: a Name Resolution Policy Table rule (`Get-DnsClientNrptRule`),
+    removed when `up` stops.
+  - Linux with systemd-resolved (Ubuntu, Fedora): the domain on the `sanvpn0`
+    link (`resolvectl status sanvpn0`).
+  - Other Linux (Debian servers, Raspberry Pi OS, Alpine): a block in
+    `/etc/hosts` between `# san_vpn begin` and `# san_vpn end`, rewritten
+    as members come and go and removed when `up` stops.
+- Every other name resolves exactly as before.
+- `setup check` resolves this machine's own name the way programs do, so it
+  checks the whole path. `nslookup office.vpn 10.77.0.254` asks the
+  member's server directly.
+- On Windows, plain `nslookup office.vpn` ignores the rule and asks the
+  usual DNS server. Test with `ping`, `Resolve-DnsName office.vpn`, or
+  `nslookup office.vpn 10.77.0.254`.
+
+To use another domain, run `san_vpn relay init --domain corp.internal` on the
+relay. Members pick it up within seconds, without a restart. Avoid `local`:
+
+- it belongs to multicast DNS, which is how `raspberrypi.local` and
+  `printer.local` work
+- Linux machines with nss-mdns never send `.local` names to a DNS server
+- on Windows, the rule would catch those LAN names too
+
+`up --no-dns` turns names off on one machine. There are no names in a
+network smaller than /29, which has no address to spare. There are none either
+where a relay from before names already gave `.254` to a member; `up` logs
+it.
+
 ## Commands
 
 | Command | Where | What |
@@ -337,13 +381,13 @@ san_vpn up                                    # or, just this once: san_vpn up -
 | `cloudrun setup [--project P] [--region R] [--service S] [--dry-run]` | any, with gcloud | Ready a project for the relay on Cloud Run, its file in Cloud Storage. Safe to rerun. |
 | `cloudrun deploy [--source DIR] [--image I] [--timeout D] [--dry-run]` | any, with gcloud | Build the relay from source with Cloud Build and run it. Again after `update`, to move it to the new release. |
 | `setup check [--json] [--profile P]` | any | Check the relay and its tunnel, and/or this member, end to end. |
-| `relay init [--url U] [--network N]` | relay | Create the relay key and network (default `10.77.0.0/24`). Run it again to change the URL; the key is kept. |
+| `relay init [--url U] [--network N] [--domain D]` | relay | Create the relay key and network (default `10.77.0.0/24`, names under `vpn`). Run it again to change the URL or the domain; the key is kept. |
 | `relay run [--listen A] [--no-tunnel] [--session-limit D]` | relay | Serve the relay (default `127.0.0.1:8443`, or `:$PORT` when `PORT` is set), and host the dev tunnel that `setup init` made. With `--session-limit`, members renew their connections before a front cuts them. |
 | `relay invite <name> [--ttl D]` | relay | Print a one-time invite. Names are lowercase letters, digits and `-`. |
 | `relay list [--json]` | relay | List members and invites still waiting. |
 | `relay remove <name>` | relay | Remove a member or an invite. A running relay disconnects the member within seconds, and the other members drop it. |
 | `join <invite> [--url U] [--header "K: V"] [--force] [--profile P]` | member, admin | Generate this machine's key and join. The private key never leaves the machine. With `--profile`, keep it beside the networks this machine is already in. |
-| `up [--interface I] [--mtu M] [--no-firewall] [--profile P]` | member, admin | Create the tunnel interface and stay connected, reconnecting by itself. |
+| `up [--interface I] [--mtu M] [--no-firewall] [--no-dns] [--profile P]` | member, admin | Create the tunnel interface, answer the members' names, and stay connected, reconnecting by itself. |
 | `status [--json] [--profile P]` | member | This machine's connection and its peers. |
 | `profile list [--json]` | member, admin | This machine's profiles: the one `up` brings up, and the one running. |
 | `profile use <profile>` | member, admin | Make a profile the one `up` brings up. A running `up` switches once restarted. |
@@ -365,6 +409,7 @@ also `gs://<bucket>[/<folder>]`) and `--log-level` (env `SAN_VPN_LOG_LEVEL`).
 | Member (`node.json`, `status.json`) | `C:\ProgramData\san_vpn`, SYSTEM and Administrators only | `/var/lib/san_vpn`, mode 0700 |
 | Other profiles (`profiles/<name>/node.json`), the current one (`profile.json`) | in the member's folder | the same |
 | Interface | `san_vpn` (Wintun) | `sanvpn0` (TUN) |
+| Names, while `up` runs | an NRPT rule with the comment `san_vpn` | systemd-resolved's setting for `sanvpn0`, else a block in `/etc/hosts` |
 
 ## Notes
 
@@ -396,11 +441,15 @@ also `gs://<bucket>[/<folder>]`) and `--log-level` (env `SAN_VPN_LOG_LEVEL`).
 - **TCP inside TCP.** The WebSocket rides TCP, so on lossy links (mobile, bad
   Wi-Fi) throughput drops more than with native WireGuard.
 - **No boot service yet.** `up` runs in a terminal.
-- **IPv4 only, no DNS names.** Use the addresses that `status` shows.
+- **IPv4 only.** Names resolve to IPv4 addresses. They cover the members
+  only: no reverse lookups and no other records.
 - **Only the machines running san_vpn are on the network**, not their LANs.
 - **The relay is trusted to say who the members are.** It cannot read traffic,
   but a compromised relay could add a member of its own. On Cloud Run, the same
   goes for anyone who can write the bucket, which also holds the relay's key.
+- **Names on Windows are new.** The rule's commands and parameters are
+  checked, and names ran end to end on Linux with a real kernel, but the rule
+  has not yet been added on a real Windows machine.
 - **Cloud Run support is new.** It has been tested with a fake gcloud, and with
   the relay's image in Docker against a Cloud Storage emulator. It has not yet
   run on a real Google Cloud project.

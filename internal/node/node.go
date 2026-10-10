@@ -12,12 +12,14 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/wargasipil/san_vpn/internal/names"
 	"github.com/wargasipil/san_vpn/internal/wire"
 )
 
@@ -44,6 +46,10 @@ type Options struct {
 	// OnChange, if set, is called when the connection or the member list
 	// changes, so a status display can refresh at once. It must not block.
 	OnChange func()
+	// Names makes the node answer DNS queries for the members' names
+	// (office.vpn) at the network's DNS address, inside the tunnel. Pointing
+	// the operating system at it is osnet's job.
+	Names bool
 }
 
 // Node is a running member.
@@ -52,6 +58,9 @@ type Node struct {
 	log  *slog.Logger
 	bind *relayBind
 	dev  *device.Device
+	// names is the members' names as the last member list gave them; nil
+	// before the first, or without Options.Names.
+	names atomic.Pointer[names.Table]
 
 	mu        sync.Mutex
 	peers     map[wire.Key]netip.Addr
@@ -76,8 +85,12 @@ func New(o Options) (*Node, error) {
 	}
 	n := &Node{o: o, log: o.Log, bind: newRelayBind(), peers: map[wire.Key]netip.Addr{}, conns: map[wire.Key]uint64{}}
 
+	dev := o.TUN
+	if server, ok := wire.DNSAddr(o.Config.Network); o.Names && ok && server != o.Config.IP {
+		dev = names.Intercept(dev, server, n.names.Load)
+	}
 	wglog := o.Log.With("component", "wireguard")
-	n.dev = device.NewDevice(o.TUN, n.bind, &device.Logger{
+	n.dev = device.NewDevice(dev, n.bind, &device.Logger{
 		Verbosef: func(f string, a ...any) { wglog.Debug(fmt.Sprintf(f, a...)) },
 		Errorf:   func(f string, a ...any) { wglog.Warn(fmt.Sprintf(f, a...)) },
 	})
@@ -466,9 +479,22 @@ func (n *Node) applyNetmap(nm *wire.Netmap) {
 	}
 	n.peers = want
 	n.netmap = nm
+	if n.o.Names {
+		t := names.FromNetmap(nm)
+		if server, ok := wire.DNSAddr(nm.Network); ok && !t.Server.IsValid() {
+			if old := n.names.Load(); old == nil || old.Server.IsValid() {
+				n.log.Warn("names are off: a member holds the network's DNS address, which relays before names gave out", "address", server)
+			}
+		}
+		n.names.Store(t)
+	}
 	n.log.Debug("member list", "peers", len(want))
 	n.changed()
 }
+
+// Names is the members' names, as the node answers for them: nil before the
+// first member list, or when the node was not asked to (Options.Names).
+func (n *Node) Names() *names.Table { return n.names.Load() }
 
 func (n *Node) changed() {
 	if n.o.OnChange != nil {
@@ -509,7 +535,11 @@ type Status struct {
 	Connected bool         `json:"connected"`
 	Since     time.Time    `json:"since,omitzero"`
 	LastError string       `json:"last_error,omitempty"`
-	Peers     []PeerStatus `json:"peers"`
+	// Domain and DNS say where the members' names are answered: office.vpn
+	// at 10.77.0.254. Empty when names are off.
+	Domain string       `json:"domain,omitempty"`
+	DNS    netip.Addr   `json:"dns,omitzero"`
+	Peers  []PeerStatus `json:"peers"`
 }
 
 // PeerStatus is one other member.
@@ -547,6 +577,9 @@ func (n *Node) Status() Status {
 	}
 	if n.connected {
 		st.Since = n.since
+	}
+	if t := n.names.Load(); t != nil && t.Server.IsValid() {
+		st.Domain, st.DNS = t.Domain, t.Server
 	}
 	if n.netmap != nil {
 		for _, p := range n.netmap.Peers {

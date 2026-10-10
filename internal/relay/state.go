@@ -37,8 +37,10 @@ type State struct {
 	// its https URL, not the local listen address.
 	URL     string       `json:"url,omitempty"`
 	Network netip.Prefix `json:"network"`
-	Nodes   []Node       `json:"nodes"`
-	Invites []Invite     `json:"invites"`
+	// Domain is what members' names end in; empty means wire.DefaultDomain.
+	Domain  string   `json:"domain,omitempty"`
+	Nodes   []Node   `json:"nodes"`
+	Invites []Invite `json:"invites"`
 	// Tunnel is the dev tunnel `setup init` put in front of the relay, which
 	// `relay run` hosts. Nil when the relay is fronted some other way.
 	Tunnel *Tunnel `json:"tunnel,omitempty"`
@@ -184,12 +186,25 @@ func (s *State) Remove(name string) (string, error) {
 	return "", fmt.Errorf("no node or invite named %q", name)
 }
 
+// DomainOrDefault is the members' domain.
+func (s *State) DomainOrDefault() string {
+	if s.Domain == "" {
+		return wire.DefaultDomain
+	}
+	return s.Domain
+}
+
 // allocate returns the lowest free host address. Addresses of removed nodes
-// are reused; WireGuard keys, not addresses, are what peers trust.
+// are reused; WireGuard keys, not addresses, are what peers trust. The
+// network's DNS address is never given out: every member answers there for
+// the members' names.
 func (s *State) allocate() (netip.Addr, error) {
-	used := make(map[netip.Addr]bool, len(s.Nodes))
+	used := make(map[netip.Addr]bool, len(s.Nodes)+1)
 	for _, n := range s.Nodes {
 		used[n.IP] = true
+	}
+	if dns, ok := wire.DNSAddr(s.Network); ok {
+		used[dns] = true
 	}
 	broadcast := lastAddr(s.Network)
 	for a := s.Network.Addr().Next(); s.Network.Contains(a) && a != broadcast; a = a.Next() {

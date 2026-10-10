@@ -33,6 +33,7 @@ import (
 	"github.com/wargasipil/san_vpn/internal/relay"
 	"github.com/wargasipil/san_vpn/internal/state"
 	"github.com/wargasipil/san_vpn/internal/update"
+	"github.com/wargasipil/san_vpn/internal/wire"
 )
 
 // version is stamped by the build scripts.
@@ -87,6 +88,7 @@ func relayCommand() *cli.Command {
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "url", Usage: "the URL members dial, e.g. https://<id>-8443.asse.devtunnels.ms"},
 					&cli.StringFlag{Name: "network", Value: relay.DefaultNetwork.String(), Usage: "overlay address range"},
+					&cli.StringFlag{Name: "domain", Value: wire.DefaultDomain, Usage: "what the members' names end in: office.vpn"},
 				},
 				Action: runRelayInit,
 			},
@@ -171,6 +173,10 @@ func runRelayInit(ctx context.Context, cmd *cli.Command) error {
 			return err
 		}
 	}
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(cmd.String("domain"), "."), "."))
+	if err := wire.ValidDomain(domain); err != nil {
+		return fmt.Errorf("--domain: %w", err)
+	}
 	if f, ok := store.(state.File); ok {
 		if err := state.EnsureDir(filepath.Dir(string(f)), false); err != nil {
 			return err
@@ -197,6 +203,9 @@ func runRelayInit(ctx context.Context, cmd *cli.Command) error {
 		if url != "" {
 			st.URL = url
 		}
+		if cmd.IsSet("domain") {
+			st.Domain = domain
+		}
 		return nil
 	})
 	if err != nil {
@@ -209,7 +218,10 @@ func runRelayInit(ctx context.Context, cmd *cli.Command) error {
 	} else {
 		fmt.Fprintf(w, "updated relay %s\n", store)
 	}
-	fmt.Fprintf(w, "  key      %s\n  network  %s\n  url      %s\n", st.PrivateKey.Public(), st.Network, orNone(st.URL))
+	fmt.Fprintf(w, "  key      %s\n  network  %s\n  domain   %s\n  url      %s\n", st.PrivateKey.Public(), st.Network, st.DomainOrDefault(), orNone(st.URL))
+	if d := st.DomainOrDefault(); d == "local" || strings.HasSuffix(d, ".local") {
+		fmt.Fprintln(w, "\nNote: .local belongs to multicast DNS. Linux machines with nss-mdns never ask a DNS server about it,\nand Windows may send printer.local and other LAN names to san_vpn while up runs.")
+	}
 	if st.URL == "" {
 		fmt.Fprintln(w, "\nInvites need the URL members will dial. Set it with: san_vpn relay init --url <https://...>")
 	}
@@ -354,10 +366,11 @@ func runRelayList(ctx context.Context, cmd *cli.Command) error {
 		}
 		out := struct {
 			Network netip.Prefix `json:"network"`
+			Domain  string       `json:"domain"`
 			URL     string       `json:"url"`
 			Nodes   []member     `json:"nodes"`
 			Invites []pending    `json:"invites"`
-		}{Network: st.Network, URL: st.URL, Nodes: []member{}, Invites: []pending{}}
+		}{Network: st.Network, Domain: st.DomainOrDefault(), URL: st.URL, Nodes: []member{}, Invites: []pending{}}
 		for _, n := range st.Nodes {
 			out.Nodes = append(out.Nodes, member{n.Name, n.IP, n.PublicKey.String(), n.Joined})
 		}
@@ -371,7 +384,7 @@ func runRelayList(ctx context.Context, cmd *cli.Command) error {
 		return enc.Encode(out)
 	}
 
-	fmt.Fprintf(w, "network %s  url %s\n\n", st.Network, orNone(st.URL))
+	fmt.Fprintf(w, "network %s  domain %s  url %s\n\n", st.Network, st.DomainOrDefault(), orNone(st.URL))
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tIP\tJOINED\tKEY")
 	for _, n := range st.Nodes {
@@ -546,6 +559,7 @@ func upCommand() *cli.Command {
 			&cli.StringFlag{Name: "interface", Value: osnet.DefaultName, Usage: "tunnel interface name"},
 			&cli.IntFlag{Name: "mtu", Value: osnet.DefaultMTU, Usage: "tunnel MTU"},
 			&cli.BoolFlag{Name: "no-firewall", Usage: "on Windows, do not add the inbound firewall rule for the other members"},
+			&cli.BoolFlag{Name: "no-dns", Usage: "do not answer or resolve the members' names (office.vpn)"},
 			profileFlag(),
 		},
 		Action: runUp,
@@ -591,11 +605,11 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 	changed := make(chan struct{}, 1)
-	n, err := node.New(node.Options{Config: &cfg, TUN: dev, Log: log, OnChange: func() {
-		select {
-		case changed <- struct{}{}:
-		default:
-		}
+	namesChanged := make(chan struct{}, 1)
+	withNames := !cmd.Bool("no-dns")
+	n, err := node.New(node.Options{Config: &cfg, TUN: dev, Log: log, Names: withNames, OnChange: func() {
+		poke(changed)
+		poke(namesChanged)
 	}})
 	if err != nil {
 		_ = dev.Close()
@@ -630,9 +644,59 @@ func runUp(ctx context.Context, cmd *cli.Command) error {
 			}
 		}
 	}()
-	err = n.Run(ctx)
+
+	runCtx, stopped := context.WithCancel(ctx)
+	namesDone := make(chan struct{})
+	var osNames *osnet.Names
+	if withNames {
+		ifname, _ := dev.Name()
+		osNames = &osnet.Names{Interface: ifname}
+		go func() { defer close(namesDone); keepNames(runCtx, n, osNames, namesChanged, log) }()
+	} else {
+		close(namesDone)
+	}
+	err = n.Run(runCtx)
+	stopped()
+	<-namesDone
+	if osNames != nil {
+		if err := osNames.Clear(); err != nil {
+			log.Warn("names", "err", err)
+		}
+	}
 	_ = os.Remove(statusPath)
 	return err
+}
+
+func poke(c chan struct{}) {
+	select {
+	case c <- struct{}{}:
+	default:
+	}
+}
+
+// keepNames points this machine's lookups of the members' names at the node,
+// and keeps them current as members come and go, until ctx ends.
+func keepNames(ctx context.Context, n *node.Node, on *osnet.Names, changed <-chan struct{}, log *slog.Logger) {
+	said := false
+	for {
+		if t := n.Names(); t != nil {
+			how, err := on.Set(t)
+			switch {
+			case err != nil:
+				log.Warn("this machine may not resolve the members' names", "err", err)
+			case how != "" && !said:
+				said = true
+				log.Info("members' names resolve", "domain", t.Domain, "dns", t.Server, "via", how)
+			case how != "":
+				log.Debug("members' names updated", "via", how)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-changed:
+		}
+	}
 }
 
 func statusCommand() *cli.Command {
@@ -712,6 +776,9 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 		}
 		fmt.Fprintln(w)
 	}
+	if st.DNS.IsValid() {
+		fmt.Fprintf(w, "names %s.%s and the others below, answered at %s\n", st.Name, st.Domain, st.DNS)
+	}
 	if len(st.Peers) == 0 {
 		fmt.Fprintln(w, "\nno other members yet; invite one with `san_vpn relay invite <name>` on the relay")
 		return nil
@@ -720,6 +787,10 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tIP\tRELAY\tHANDSHAKE\tRX\tTX")
 	for _, p := range st.Peers {
+		name := p.Name
+		if st.Domain != "" {
+			name += "." + st.Domain
+		}
 		online := "offline"
 		if p.Online {
 			online = "online"
@@ -728,7 +799,7 @@ func runStatus(_ context.Context, cmd *cli.Command) error {
 		if !p.LastHandshake.IsZero() {
 			hs = ago(p.LastHandshake) + " ago"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, p.IP, online, hs, bytesize(p.RxBytes), bytesize(p.TxBytes))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", name, p.IP, online, hs, bytesize(p.RxBytes), bytesize(p.TxBytes))
 	}
 	return tw.Flush()
 }

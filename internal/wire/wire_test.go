@@ -3,6 +3,8 @@ package wire_test
 import (
 	"bytes"
 	"encoding/json"
+	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/wargasipil/san_vpn/internal/wire"
@@ -128,5 +130,38 @@ func TestJoinMACBindsTheKey(t *testing.T) {
 	}
 	if bytes.Equal(wire.JoinMAC(secret, "id", a), wire.JoinMAC(secret, "other", a)) {
 		t.Fatal("the MAC does not depend on the invite id")
+	}
+}
+
+func TestDNSAddr(t *testing.T) {
+	for network, want := range map[string]string{
+		"10.77.0.0/24": "10.77.0.254",
+		"10.77.0.9/24": "10.77.0.254", // not masked
+		"10.77.0.0/16": "10.77.255.254",
+		"10.77.0.8/29": "10.77.0.14",
+	} {
+		got, ok := wire.DNSAddr(netip.MustParsePrefix(network))
+		if !ok || got.String() != want {
+			t.Errorf("%s: %s %v, want %s", network, got, ok, want)
+		}
+	}
+	// No address to spare in a /30, and none in IPv6.
+	for _, network := range []string{"10.77.0.0/30", "fd00::/64"} {
+		if got, ok := wire.DNSAddr(netip.MustParsePrefix(network)); ok {
+			t.Errorf("%s: %s", network, got)
+		}
+	}
+}
+
+func TestValidDomain(t *testing.T) {
+	for _, ok := range []string{"vpn", "corp.internal", "home.arpa", "a-b.c1"} {
+		if err := wire.ValidDomain(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "VPN", ".vpn", "vpn.", "a..b", "-vpn", "vpn-", "my vpn", "vpn_1", strings.Repeat("a.", 101) + "a"} {
+		if wire.ValidDomain(bad) == nil {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }

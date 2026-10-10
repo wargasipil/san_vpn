@@ -106,7 +106,9 @@ func start(t *testing.T, ctx context.Context, cfg *node.Config) *testNode {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := node.New(node.Options{Config: cfg, TUN: dev, Log: quiet()})
+	// Names on, as `up` has them: every test also shows that catching DNS
+	// queries leaves the rest of the traffic alone.
+	n, err := node.New(node.Options{Config: cfg, TUN: dev, Log: quiet(), Names: true})
 	if err != nil {
 		t.Fatal(err)
 	}

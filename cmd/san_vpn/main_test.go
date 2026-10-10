@@ -5,11 +5,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/wargasipil/san_vpn/internal/node"
 	"github.com/wargasipil/san_vpn/internal/relay"
 	"github.com/wargasipil/san_vpn/internal/state"
 )
@@ -142,4 +145,55 @@ func keyLine(out string) string {
 		}
 	}
 	return ""
+}
+
+func TestRelayDomain(t *testing.T) {
+	dir := t.TempDir()
+	if out := mustRun(t, "--state", dir, "relay", "init"); !strings.Contains(out, "domain   vpn\n") || strings.Contains(out, "multicast") {
+		t.Fatalf("relay init said:\n%s", out)
+	}
+	if out := mustRun(t, "--state", dir, "relay", "init", "--domain", ".Corp.Internal."); !strings.Contains(out, "domain   corp.internal\n") {
+		t.Fatalf("relay init --domain said:\n%s", out)
+	}
+	// Kept when init runs again without it.
+	if out := mustRun(t, "--state", dir, "relay", "init"); !strings.Contains(out, "domain   corp.internal\n") {
+		t.Fatalf("second init lost the domain:\n%s", out)
+	}
+	if out := mustRun(t, "--state", dir, "relay", "list"); !strings.Contains(out, "domain corp.internal") {
+		t.Fatalf("relay list:\n%s", out)
+	}
+	if out := mustRun(t, "--state", dir, "relay", "list", "--json"); !strings.Contains(out, `"domain": "corp.internal"`) {
+		t.Fatalf("relay list --json:\n%s", out)
+	}
+	if _, err := run(t, "--state", dir, "relay", "init", "--domain", "my vpn"); err == nil {
+		t.Fatal("accepted a domain with a space")
+	}
+	if out := mustRun(t, "--state", dir, "relay", "init", "--domain", "local"); !strings.Contains(out, "multicast DNS") {
+		t.Fatalf(".local without a note:\n%s", out)
+	}
+}
+
+func TestStatusShowsNames(t *testing.T) {
+	dir := t.TempDir()
+	st := node.Status{
+		Updated: time.Now(), PID: 1, Name: "home", IP: netip.MustParseAddr("10.77.0.2"), Network: relay.DefaultNetwork,
+		Relay: "https://relay.example", Connected: true, Since: time.Now(),
+		Domain: "vpn", DNS: netip.MustParseAddr("10.77.0.254"),
+		Peers: []node.PeerStatus{{Name: "office", IP: netip.MustParseAddr("10.77.0.1"), Online: true}},
+	}
+	if err := state.Save(filepath.Join(dir, state.StatusFile), st); err != nil {
+		t.Fatal(err)
+	}
+	out := mustRun(t, "--state", dir, "status")
+	if !strings.Contains(out, "names home.vpn and the others below, answered at 10.77.0.254") || !strings.Contains(out, "office.vpn  10.77.0.1") {
+		t.Fatalf("status:\n%s", out)
+	}
+	// Names off: the plain names, and no line about them.
+	st.Domain, st.DNS = "", netip.Addr{}
+	if err := state.Save(filepath.Join(dir, state.StatusFile), st); err != nil {
+		t.Fatal(err)
+	}
+	if out := mustRun(t, "--state", dir, "status"); strings.Contains(out, "names ") || strings.Contains(out, ".vpn") || !strings.Contains(out, "office  10.77.0.1") {
+		t.Fatalf("status without names:\n%s", out)
+	}
 }

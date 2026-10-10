@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -396,6 +397,39 @@ func TestCheck(t *testing.T) {
 	}
 	if sections = Check(ctx, opts); Failed(sections) {
 		t.Fatalf("everything healthy, yet:\n%s", dump(sections))
+	}
+
+	// With names on, the check resolves this machine's own name the way any
+	// program here would.
+	named := node.Status{Updated: time.Now(), Connected: true, Name: "home", IP: cfg.IP, Domain: "vpn", DNS: netip.MustParseAddr("10.77.0.254")}
+	if err := state.Save(filepath.Join(nodeDir, state.StatusFile), named); err != nil {
+		t.Fatal(err)
+	}
+	resolves := map[string][]netip.Addr{"home.vpn": {cfg.IP}}
+	opts.LookupIP = func(_ context.Context, host string) ([]netip.Addr, error) {
+		if ips, ok := resolves[host]; ok {
+			return ips, nil
+		}
+		return nil, fmt.Errorf("lookup %s: no such host", host)
+	}
+	if sections = Check(ctx, opts); Failed(sections) || !strings.Contains(dump(sections), "home.vpn resolves to "+cfg.IP.String()) {
+		t.Fatalf("names healthy, yet:\n%s", dump(sections))
+	}
+	// Go's resolver gives a hosts file entry as ::ffff:10.77.0.1.
+	resolves["home.vpn"] = []netip.Addr{netip.AddrFrom16(cfg.IP.As16())}
+	if sections = Check(ctx, opts); Failed(sections) {
+		t.Fatalf("IPv4-mapped answer failed:\n%s", dump(sections))
+	}
+	delete(resolves, "home.vpn")
+	if text = dump(Check(ctx, opts)); !strings.Contains(text, "FAIL home.vpn does not resolve") || !strings.Contains(text, "names") {
+		t.Fatalf("unresolved name not reported:\n%s", text)
+	}
+	resolves["home.vpn"] = []netip.Addr{netip.MustParseAddr("192.168.1.9")}
+	if text = dump(Check(ctx, opts)); !strings.Contains(text, "not to this machine's "+cfg.IP.String()) {
+		t.Fatalf("wrong address not reported:\n%s", text)
+	}
+	if err := state.Save(filepath.Join(nodeDir, state.StatusFile), node.Status{Updated: time.Now(), Connected: true}); err != nil {
+		t.Fatal(err)
 	}
 
 	// Removed on the relay: the member's check says so and how to come back.

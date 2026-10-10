@@ -11,3 +11,18 @@ package osnet
 // never fragmented and a larger MTU would work; 1420 is WireGuard's own
 // default and what every tool expects, so start there.
 const DefaultMTU = 1420
+
+// Names points this machine's lookups of the members' names (office.vpn) at
+// the network's DNS address, where the node answers them:
+//   - Windows: a name resolution policy (NRPT) rule for the domain
+//   - Linux with systemd-resolved: the domain, routed to the interface
+//   - other Linux: the names themselves, in a block in /etc/hosts
+//
+// Only the domain is affected; every other name resolves as before.
+type Names struct {
+	// Interface is the tunnel interface, for systemd-resolved.
+	Interface string
+	// applied is what Set last put in place, so that setting the same again
+	// does nothing; "" for nothing.
+	applied string
+}

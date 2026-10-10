@@ -4,8 +4,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
+	"regexp"
 	"time"
 )
 
@@ -114,8 +117,11 @@ type Message struct {
 // Netmap is one node's view of the network: itself and everyone else.
 type Netmap struct {
 	Network netip.Prefix `json:"network"`
-	Self    Peer         `json:"self"`
-	Peers   []Peer       `json:"peers"`
+	// Domain is what members' names end in: office.vpn. Empty from a relay
+	// older than names, which means DefaultDomain.
+	Domain string `json:"domain,omitempty"`
+	Self   Peer   `json:"self"`
+	Peers  []Peer `json:"peers"`
 }
 
 // Peer is one member as the relay describes it.
@@ -201,6 +207,37 @@ func RenewAfter(limit time.Duration) time.Duration {
 		return 0
 	}
 	return limit - min(limit/10, 5*time.Minute)
+}
+
+// DefaultDomain is the domain members' names end in unless the relay names
+// another. Not .local: that is multicast DNS's, and Linux machines with
+// nss-mdns never ask a DNS server about it.
+const DefaultDomain = "vpn"
+
+var domainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// ValidDomain reports whether d can be the members' domain: lowercase DNS
+// labels, such as vpn or corp.internal.
+func ValidDomain(d string) error {
+	if len(d) > 200 || !domainRE.MatchString(d) {
+		return fmt.Errorf("domain %q: use lowercase letters, digits, hyphens and dots, such as vpn or corp.internal", d)
+	}
+	return nil
+}
+
+// DNSAddr is the address where every member answers for the members' names:
+// the network's last host address, 10.77.0.254 in 10.77.0.0/24. The relay
+// never gives it to a member. Inside the network, the route to the overlay
+// already carries it into each member's tunnel, where the member answers it
+// itself. A network smaller than /29 has no address to spare, so no DNS.
+func DNSAddr(network netip.Prefix) (netip.Addr, bool) {
+	if !network.Addr().Is4() || network.Bits() > 29 {
+		return netip.Addr{}, false
+	}
+	b := network.Masked().Addr().As4()
+	v := binary.BigEndian.Uint32(b[:]) | (uint32(1)<<(32-network.Bits()) - 1) // broadcast
+	binary.BigEndian.PutUint32(b[:], v-1)
+	return netip.AddrFrom4(b), true
 }
 
 // EncodeSecret and DecodeSecret give secrets a printable form.
